@@ -1,0 +1,14 @@
+{
+  "manifest_version": 1,
+  "id": "YourGitHubUser.YourRepo",
+  "name": "Your Mod Name",
+  "version": "1.0.0",
+  "author": "Your Name",
+  "description": "One short line describing what the mod does.",
+  "client_side": true,
+  "server_side": false,
+  "dependencies": {},
+  "library_dependencies": [],
+  "download_url": "https://github.com/YourGitHubUser/YourRepo/releases/download/v1.0.0/YourMod.dll",
+  "sha256": "run: python tools/modindex.py fill-hashes"
+}

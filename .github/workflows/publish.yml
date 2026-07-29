@@ -1,0 +1,85 @@
+name: Publish index
+
+# Runs after a maintainer merges an approved submission to main. Ingests any
+# submissions/ manifests into manifests/<author>/<repo>/, regenerates the
+# latest*.json pointers and repository.json, and commits the result back.
+# Submitters never hand-edit the index.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "submissions/**"
+      - "manifests/**"
+      - "tools/**"
+  workflow_dispatch:
+
+# The push below goes to main, which is protected (PRs required). The default
+# GITHUB_TOKEN (github-actions[bot]) is not on the ruleset bypass list, so it
+# would be rejected. Instead we mint a token from a dedicated GitHub App that IS
+# on the bypass list, and push as that app. Needs two secrets: PUBLISH_APP_ID and
+# PUBLISH_APP_PRIVATE_KEY (the app's private key .pem). The app only needs
+# Contents: Read and write on this repo.
+permissions:
+  contents: read
+
+# Serialize index builds: at most one runs at a time. A run in progress is never
+# cancelled (cancel-in-progress: false); newer pushes queue behind it. So two
+# Actions can never edit manifests/ or repository.json at once. Each build is a
+# full rebuild from the committed tree, so the last run to execute still picks up
+# every merged submission even if a queued run gets superseded.
+concurrency:
+  group: publish-index
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint a token from the publish app (on the ruleset bypass list)
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.PUBLISH_APP_ID }}
+          private-key: ${{ secrets.PUBLISH_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v4
+        with:
+          # Persist this token as the git credential so the commit + push below
+          # are made by the app, which bypasses branch protection.
+          token: ${{ steps.app-token.outputs.token }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Compile index (ingest approved submissions)
+        run: python tools/modindex.py build --ingest --prune
+
+      - name: Commit regenerated index
+        run: |
+          git config user.name '${{ steps.app-token.outputs.app-slug }}[bot]'
+          git config user.email '${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com'
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Index already up to date, nothing to commit."
+            exit 0
+          fi
+          git commit -m "chore(index): rebuild after merge"
+          # The concurrency group already rules out a competing publish run. This
+          # loop only guards the rare case of a NON-publish commit (a human, or
+          # another workflow) landing on main between our checkout and push:
+          # rebase onto it, rebuild from the combined tree (idempotent), retry.
+          for attempt in 1 2 3 4 5; do
+            if git push; then
+              echo "pushed on attempt $attempt"
+              exit 0
+            fi
+            echo "push rejected; rebasing onto latest main and rebuilding"
+            git pull --rebase origin main
+            python tools/modindex.py build --ingest --prune
+            git add -A
+            git diff --cached --quiet || git commit --amend --no-edit
+          done
+          echo "could not push index after retries" >&2
+          exit 1

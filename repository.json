@@ -1,0 +1,17 @@
+{
+  "index_version": 1,
+  "mods": {
+    "ChatonIsHere.CircuitsVoiceChat": {
+      "1": {
+        "name": "Circuits Voice Chat",
+        "author": "ChatonIsHere",
+        "description": "Proximity voice chat for A Township Tale.",
+        "client_side": true,
+        "server_side": true,
+        "versions": [
+          "1.0.4"
+        ]
+      }
+    }
+  }
+}
