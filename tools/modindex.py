@@ -2,42 +2,34 @@
 """
 modindex, the CommunityMods repository's own tooling.
 
-This is the automation SUBMITTING.md describes: it validates submitted manifests
-(Layer 1) and compiles the static index the launcher reads. It is NOT required to
-*host* a source. A third-party source only has to serve the file layout in
-docs/REPO_STRUCTURE.md. This tool is how the official, curated repo enforces its
-extra checks and generates its files.
+Validates submitted manifests (Layer 1) and compiles the static index the
+launcher reads. A third-party source doesn't need this tool, only the file
+layout in docs/REPO_STRUCTURE.md.
 
 Stdlib only, no pip install, so it runs in CI and in any fork with bare Python.
 
 Subcommands
 -----------
   fill-hashes [paths]   Download the files a manifest points at and write their
-                        real sha256 into it (mod + every library). For a submitter
-                        who'd rather not compute hashes by hand; run it after
-                        publishing your release, before you submit. Defaults to
-                        every submissions/**/*.json.
+                        real sha256 in (mod + every library). Defaults to every
+                        submissions/**/*.json.
 
-  validate [paths...]   Layer-1 validation of submission manifest(s). Defaults to
-                        every submissions/**/*.json. Checks schema, id/ownership,
-                        filename safety, version format, sides, and downloads +
-                        hashes every file. Runs a VirusTotal scan when
-                        VIRUSTOTAL_API_KEY is set (reported; gate with
-                        --vt-max-malicious). Exits non-zero on any hard failure.
+  validate [paths...]   Layer-1 validation of submission manifest(s). Checks
+                        schema, id/ownership, filename safety, version format,
+                        sides, and downloads + hashes every file. Runs a
+                        VirusTotal scan when VIRUSTOTAL_API_KEY is set (gate
+                        with --vt-max-malicious). Defaults to every
+                        submissions/**/*.json. Exits non-zero on failure.
 
   build [--ingest]      Compile the index. Reads every manifests/**/<version>.json,
         [--prune]       regenerates each mod's latest.json / latest.<major>.json
-                        pointers, and rebuilds repository.json as a slim discovery
-                        index: one summary per (id, major) with a versions list, no
-                        urls/hashes/deps (those stay in the per-version manifests).
-                        With --ingest it first validates and moves
-                        submissions/**/*.json into
-                        manifests/<author>/<repo>/<version>.json; --prune deletes the
-                        ingested submission files afterwards.
+                        pointers, and rebuilds repository.json. With --ingest,
+                        first validates and moves submissions/**/*.json into
+                        manifests/<author>/<repo>/<version>.json; --prune then
+                        deletes the moved submission files.
 
-The validation rules here MUST stay in lockstep with the launcher's parser
-(TavernLauncher/modmanager.py) and with docs/REPO_STRUCTURE.md. If one changes,
-change all three.
+Keep these rules in sync with the launcher's parser (TavernLauncher/modmanager.py)
+and docs/REPO_STRUCTURE.md.
 """
 
 import argparse
@@ -56,10 +48,8 @@ import uuid
 import zipfile
 from urllib.parse import urlparse
 
-# Schema majors this tool speaks, kept in lockstep with the launcher's parser.
-# Two separate schemas: the per-version manifest (full record) and the
-# repository.json index (slim summaries). They version independently, so a change
-# to one doesn't force a bump of the other.
+# Schema majors this tool speaks, kept in sync with the launcher's parser.
+# The manifest and index schemas version independently.
 SUPPORTED_MANIFEST_MAJOR = 1     # modmanager.SUPPORTED_MANIFEST_MAJOR
 SUPPORTED_INDEX_MAJOR = 1        # modmanager.SUPPORTED_INDEX_MAJOR
 
@@ -79,11 +69,10 @@ _MANIFEST_ORDER = [
 ]
 _LIB_ORDER = ["name", "download_url", "sha256", "filename"]
 
-# A mod's download_url is either a single assembly ("dll") or an archive extracted
-# into Mods/<id>/ ("zip"). Must match modmanager.ModManifest.package. Submitters
-# never write this — the tooling determines it from the file's own bytes during
-# validation/ingest (see _sniff_package) and bakes it into the compiled manifest,
-# so it can't be declared wrong. The client just reads it.
+# A mod's download_url is a single assembly ("dll") or an archive extracted into
+# Mods/<id>/ ("zip"). Must match modmanager.ModManifest.package. Set by the
+# tooling from the file's own bytes during validation/ingest (see
+# _sniff_package), never written by submitters.
 _PACKAGE_TYPES = ("dll", "zip")
 
 
@@ -92,12 +81,11 @@ def _sniff_package(head):
     assembly (or anything else) does not. Unambiguous for the two supported types."""
     return "zip" if head[:2] == b"PK" else "dll"
 
-# Zip-bundle safety limits (package == "zip"), enforced when the archive is
-# downloaded during network validation. Generous enough for a real mod that ships
-# Unity asset bundles, tight enough to reject an obvious decompression bomb or a
-# mis-packaged archive. The launcher's extractor (modmanager._safe_extract_zip)
-# enforces the same intent at install time against *actual* decompressed bytes,
-# for the unreviewed-third-party-repo path that never ran this validator.
+# Zip-bundle safety limits, enforced when the archive is downloaded during
+# validation. Sized to allow a real mod's Unity asset bundles while still
+# rejecting a decompression bomb. The launcher's extractor
+# (modmanager._safe_extract_zip) applies the same limits at install time, for
+# third-party sources that skip this validator.
 ZIP_MAX_ENTRIES = 2000
 ZIP_MAX_TOTAL_UNCOMPRESSED = 500 * 1024 * 1024   # 500 MB extracted, summed
 ZIP_MAX_RATIO = 200                              # per-entry uncompressed/compressed
@@ -106,13 +94,12 @@ ZIP_RATIO_MIN_SIZE = 1 * 1024 * 1024             # ignore the ratio below this s
 _VT_BASE = "https://www.virustotal.com/api/v3"
 _VT_SIMPLE_UPLOAD_MAX = 32 * 1024 * 1024   # files larger than this need an upload URL
 
-# Which members of a zip bundle get VirusTotal-scanned. A bulky mod is mostly inert
-# assets (3D models, textures, audio, Unity asset bundles) that don't execute — the
-# risk lives in the code. Scanning only code-bearing members keeps every upload tiny
-# (so a big bundle whose whole-archive size would blow past VT's limit is still
-# meaningfully scanned) and gives per-file results. A member is code-bearing by
-# extension OR by leading magic bytes, so a renamed executable (evil.png that's
-# really a PE) is caught too.
+# Which members of a zip bundle get VirusTotal-scanned. Only code-bearing files
+# are scanned individually rather than the whole archive, since a bulky mod is
+# mostly inert assets (3D models, textures, audio, Unity asset bundles) and a
+# whole-archive upload could exceed VT's size limit. A member counts as
+# code-bearing by extension or by leading magic bytes, so a renamed executable
+# is still caught.
 _CODE_EXTENSIONS = {
     ".dll", ".exe", ".so", ".dylib", ".netmodule",           # managed / native
     ".bat", ".cmd", ".com", ".scr", ".msi", ".jar",          # binaries / installers
@@ -160,8 +147,8 @@ def _is_safe_basename(name):
 
 def parse_id(mod_id):
     """id is '<github-user>.<github-repo>'. The author is everything before the
-    FIRST dot (GitHub usernames can't contain one); the repo is the rest (repo
-    names CAN contain dots). Returns (author, repo) or raises ValidationError."""
+    first dot (GitHub usernames can't contain one); the repo is the rest.
+    Returns (author, repo) or raises ValidationError."""
     if not isinstance(mod_id, str) or "." not in mod_id:
         raise ValidationError(f"id {mod_id!r} must be '<user>.<repo>'")
     author, repo = mod_id.split(".", 1)
@@ -208,11 +195,9 @@ def summary_entry(highest_manifest, versions_in_major):
 
 
 def _write_json(path, obj):
-    # newline="\n" forces LF regardless of OS. Without it, text mode on Windows
-    # would translate every "\n" to "\r\n", so running build/fill-hashes on Windows
-    # would rewrite these generated files with CRLF and dirty them against the
-    # repo's LF convention (.gitattributes eol=lf) — even with no real change. CI
-    # runs on Linux and never hit this; a Windows maintainer would.
+    # newline="\n" forces LF regardless of OS, so these generated files don't get
+    # rewritten with CRLF on Windows and dirty the diff against the repo's LF
+    # convention (.gitattributes eol=lf).
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
@@ -223,7 +208,7 @@ def _write_json(path, obj):
 
 def validate_structure(m):
     """Every mechanical rule from docs/REPO_STRUCTURE.md section 4. Returns a list of
-    error strings (empty == structurally valid). Does NOT touch the network."""
+    error strings (empty == structurally valid). Does not touch the network."""
     errs = []
 
     if m.get("manifest_version") != SUPPORTED_MANIFEST_MAJOR:
@@ -252,7 +237,7 @@ def validate_structure(m):
     if not isinstance(m.get("dependencies", {}), dict):
         errs.append("dependencies must be an object (use {} when none)")
 
-    # A mod has no `filename` — it installs as Mods/<id>/<id>.dll (single dll) or
+    # A mod has no `filename`, it installs as Mods/<id>/<id>.dll (single dll) or
     # the zip names its own files. Only `library_dependencies[].filename` matters
     # (checked below); it's resolved by exact name in UserLibs/.
 
@@ -262,7 +247,7 @@ def validate_structure(m):
     pkg = m.get("package")
     if pkg is not None and pkg not in _PACKAGE_TYPES:
         errs.append(f'package {pkg!r} must be one of {_PACKAGE_TYPES} '
-                    "(normally omitted — the tooling sets it)")
+                    "(normally omitted, the tooling sets it)")
 
     if not isinstance(m.get("download_url"), str) or not m["download_url"]:
         errs.append("download_url is required")
@@ -327,12 +312,10 @@ def _is_https_url(url):
 
 def _assert_safe_to_fetch(url):
     """Refuse anything but an https:// URL whose host resolves only to public
-    addresses. Defense-in-depth for the fact that validation runs in a context
-    holding secrets (see .github/workflows/validate.yml): this blocks file://
-    local reads such as /proc/self/environ, and SSRF to loopback, private, or
-    link-local/metadata (169.254.x.x) addresses. Raises ValidationError if the
-    URL is unsafe. Belt-and-braces with the https-only structural check, so it
-    also guards paths that skip validation (fill-hashes, already-built manifests)."""
+    addresses. Blocks file:// reads and SSRF to loopback/private/link-local
+    addresses, since validation runs in a context holding secrets (see
+    .github/workflows/validate.yml). Raises ValidationError if the URL is
+    unsafe."""
     p = urlparse(url)
     if p.scheme != "https":
         raise ValidationError(f"refusing to fetch non-https URL {url!r}")
@@ -386,10 +369,9 @@ def _sha256_of_url(url):
 
 
 def _sniff_package_from_url(url):
-    """Determine dll vs zip by reading only the first few bytes of the download, so
-    a submitter never declares `package` — ingest sets it from the actual file. The
-    stream is closed after 8 bytes, so this doesn't pull the whole (possibly large)
-    archive just to read a magic number."""
+    """Determines dll vs zip from the first few bytes of the download, without
+    pulling the whole file. Used by ingest to set `package` from the actual
+    file."""
     _assert_safe_to_fetch(url)
     req = urllib.request.Request(url, headers={"User-Agent": "modindex"})
     with urllib.request.urlopen(req, timeout=60) as r:
@@ -399,21 +381,14 @@ def _sniff_package_from_url(url):
 
 # -- VirusTotal (Layer 1, when a key is configured) --------------------------
 
-# The VirusTotal free public API allows 4 requests/minute (and 500/day). A single
-# submission can need far more than 4 calls — a hash lookup + an upload + several
-# poll requests, times each file scanned (mod, every library, and every code-bearing
-# zip member) — so the tooling paces ITSELF to stay under the limit rather than
-# firing everything at once and getting throttled. Two layers:
-#   1. Proactive: _vt_throttle never lets more than _VT_MAX_PER_MIN requests fire
-#      inside a rolling 60s window; when the window is full it sleeps until a slot
-#      frees. This alone keeps a well-behaved run under the cap.
-#   2. Reactive: if VT still answers HTTP 429 ("too many requests") — e.g. another
-#      job used the same key, or our estimate drifted — _vt_request waits out the
-#      window (honouring Retry-After when present) and retries, so a scan is delayed,
-#      never silently skipped. GitHub Actions already runs one validation at a time,
-#      so this pacing is all that's needed to serialise VT calls safely.
-# A maintainer with a higher-tier key can raise the ceiling via the VT_MAX_PER_MINUTE
-# env var.
+# VirusTotal's free API allows 4 requests/minute. A submission can need many
+# more calls than that (lookup + upload + polling, per file scanned), so calls
+# are paced to stay under the limit:
+#   1. _vt_throttle keeps calls under _VT_MAX_PER_MIN in a rolling 60s window,
+#      sleeping when the window is full.
+#   2. _vt_request retries on HTTP 429, waiting out the window (honouring
+#      Retry-After when present).
+# Raise the cap via the VT_MAX_PER_MINUTE env var for a higher-tier key.
 _VT_WINDOW_SECONDS = 60
 _VT_MAX_RETRIES = 5
 _vt_request_times = []       # monotonic timestamps of recent VT API calls
@@ -458,9 +433,8 @@ def _vt_request(url, api_key, method="GET", data=None, content_type=None):
             with urllib.request.urlopen(req, timeout=120) as r:
                 return json.load(r)
         except urllib.error.HTTPError as e:
-            # Retry only on 429 (rate limited), and only while retries remain; any
-            # other HTTP error, or an exhausted 429, propagates to the caller (where
-            # _vt_scan_path turns it into a non-gating "scan could not complete").
+            # Retry only on 429, and only while retries remain. Other errors
+            # propagate to the caller.
             if e.code != 429 or attempt >= _VT_MAX_RETRIES:
                 raise
             try:
@@ -540,11 +514,8 @@ def _iter_json(paths):
             yield p
 
 
-# Files under submissions/ that are not themselves submissions: folder READMEs
-# and the copy-me TEMPLATE.json. Skipped by validate, fill-hashes, and ingest so
-# the template never fails a PR check or lands in the index. A real submission is
-# submissions/<author>.<repo>/<version>.json, so its basename is always a version
-# like "1.2.0.json" and never collides with these reserved names.
+# Files under submissions/ that aren't submissions: folder READMEs and the
+# copy-me TEMPLATE.json. Skipped by validate, fill-hashes, and ingest.
 _NON_SUBMISSION_BASENAMES = {"readme.json", "template.json"}
 
 
@@ -555,17 +526,14 @@ def _is_submission_file(path):
 def inspect_zip_bundle(path):
     """Content checks for a package="zip" mod bundle, run on the downloaded,
     hash-verified archive. Mirrors the launcher's extract-time guards
-    (modmanager._safe_extract_zip) — no absolute paths, no '..' traversal, no
-    symlinks — adds decompression-bomb caps, and confirms the bundle actually
-    carries a loadable assembly. Returns (errs, warns).
+    (modmanager._safe_extract_zip): no absolute paths, no '..' traversal, no
+    symlinks. Also caps decompression size and confirms a loadable assembly is
+    present. Returns (errs, warns).
 
-    The ".dll at the archive root" rule is a HARD requirement: MelonLoader loads a
-    mod folder by scanning the folder itself for assemblies (Mods/<id>/*.dll) and
-    does NOT recurse into subfolders, so a bundle whose only .dll is nested would
-    extract fine and then silently never load. The archive root maps to Mods/<id>/,
-    so at least one .dll must sit at the root. We do NOT require exactly one — a
-    bundle may legitimately ship several managed assemblies. See
-    docs/REPO_STRUCTURE.md."""
+    MelonLoader only scans a mod's own folder for assemblies (Mods/<id>/*.dll)
+    and doesn't recurse into subfolders, so at least one .dll must sit at the
+    archive root or the mod would extract fine and never load. Several root
+    .dlls are fine. See docs/REPO_STRUCTURE.md."""
     errs, warns = [], []
     try:
         zf = zipfile.ZipFile(path)
@@ -604,18 +572,18 @@ def inspect_zip_bundle(path):
             errs.append(f"zip extracts to {total} bytes, over the "
                         f"{ZIP_MAX_TOTAL_UNCOMPRESSED}-byte cap")
         if any_dll == 0:
-            errs.append('package is "zip" but the archive contains no .dll — '
+            errs.append('package is "zip" but the archive contains no .dll, '
                         "MelonLoader would have nothing to load")
         elif root_dll == 0:
             errs.append("zip bundle has .dll files only in subfolders, none at the "
-                        "archive root — MelonLoader loads Mods/<id>/*.dll and does "
+                        "archive root, MelonLoader loads Mods/<id>/*.dll and does "
                         "not recurse into subfolders, so the mod would never load. "
                         "Put the mod assembly at the archive root.")
     return errs, warns
 
 
 def _is_code_bearing(name, head):
-    """True if a zip member could carry executable code — by extension OR by leading
+    """True if a zip member could carry executable code, by extension OR by leading
     magic bytes, so a renamed executable is still caught. `head` is the first few
     bytes of the member."""
     if os.path.splitext(name)[1].lower() in _CODE_EXTENSIONS:
@@ -656,7 +624,7 @@ def _vt_scan_zip_members(zip_path, api_key, vt_max_malicious, label, errs, warns
             with zf.open(info) as f:
                 head = f.read(8)
                 if not _is_code_bearing(info.filename, head):
-                    continue                       # inert asset — not read past its head
+                    continue                       # inert asset, not read past its head
                 data = head + f.read()
             scanned += 1
             sha = hashlib.sha256(data).hexdigest()
@@ -677,7 +645,7 @@ def _vt_scan_zip_members(zip_path, api_key, vt_max_malicious, label, errs, warns
 def _check_file(url, expected_sha, api_key, vt_max_malicious, label, allow_zip=False):
     """Download url, verify its sha256 == expected, and scan it. For the mod
     (allow_zip=True) the file type is sniffed from its own bytes: a zip is inspected
-    and its code-bearing members VT-scanned (not the whole archive — see
+    and its code-bearing members VT-scanned (not the whole archive, see
     _vt_scan_zip_members); a single dll is VT-scanned whole. Libraries
     (allow_zip=False) are always single files. Returns (hard_errors, warnings).
     Cleans up its temp file."""
@@ -840,8 +808,8 @@ def _ingest_submissions(root):
             raise ValidationError(
                 f"{os.path.relpath(path, root)} is not structurally valid:\n  - "
                 + "\n  - ".join(errs))
-        # Determine dll vs zip from the actual file — the submitter never declares
-        # it — and bake it into the compiled manifest so the client just reads it.
+        # Determine dll vs zip from the actual file and bake it into the
+        # compiled manifest; submitters never declare it.
         m["package"] = _sniff_package_from_url(m["download_url"])
         author, repo = parse_id(m["id"])
         dest = os.path.join(man_dir, author, repo, f'{m["version"]}.json')

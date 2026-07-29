@@ -81,7 +81,7 @@ class Structure(unittest.TestCase):
         self.assertEqual(mi._sniff_package(b""), "dll")
 
     def test_mod_has_no_filename_field(self):
-        # A mod-level filename is neither required nor rejected — it's simply not
+        # A mod-level filename is neither required nor rejected, it's simply not
         # part of the schema anymore (the mod installs as <id>.dll).
         self.assertEqual(mi.validate_structure(manifest()), [])
         self.assertNotIn("filename", mi.ordered_manifest(manifest()))
@@ -138,7 +138,7 @@ class InspectZipBundle(unittest.TestCase):
 
     def test_dll_only_in_subfolder_is_error(self):
         # MelonLoader loads Mods/<id>/*.dll and does not recurse, so a nested-only
-        # .dll would never load — hard fail, not a warning.
+        # .dll would never load, hard fail, not a warning.
         errs, _ = mi.inspect_zip_bundle(self._zip([("sub/Mod.dll", b"MZ")]))
         self.assertTrue(any("archive root" in e for e in errs))
 
@@ -271,8 +271,7 @@ class VirusTotalRateLimit(unittest.TestCase):
         self.assertEqual(len(self.slept), 2)          # waited before each retry
 
     def test_gives_up_after_max_retries(self):
-        # Persistent 429 eventually re-raises the real HTTPError (caught upstream as
-        # a non-gating "scan could not complete"), after exhausting the retries.
+        # Persistent 429 eventually re-raises HTTPError after exhausting retries.
         calls = {"n": 0}
         def always_429(req, timeout=120):
             calls["n"] += 1
