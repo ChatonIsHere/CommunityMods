@@ -1,0 +1,164 @@
+name: Validate submissions
+
+# Layer 1 of the trust model (see docs/SUBMITTING.md): every pull request that
+# adds or changes a submission is checked mechanically before a human reviews it.
+# This gate does NOT merge anything; it tells the maintainer and submitter whether
+# the structure, ownership, and hashes are sound, surfaces the VirusTotal result,
+# and posts the outcome as a PR comment (pass or fail).
+#
+# It enforces two things before it trusts a fork's PR:
+#   1. Shape: a fork PR must ADD exactly one file, the new manifest under
+#      submissions/<author>.<repo>/<version>.json, and change nothing else. That
+#      stops a submission from smuggling in edits to tooling, workflows, the
+#      index, or another mod's manifest. Same-repo (maintainer) PRs are exempt,
+#      since they are trusted and reviewed and sometimes need multi-file changes.
+#   2. Content: structure, ownership, hashes, and VirusTotal (via modindex.py).
+#
+# SECURITY - why this uses pull_request_target:
+# A plain pull_request run from a fork gets a read-only token and no secrets, so
+# it can neither run VirusTotal nor comment. pull_request_target instead runs in
+# the BASE repo's context, where the secret (VIRUSTOTAL_API_KEY) and a write token
+# are available - that is what makes VT and the comment work for fork PRs too.
+#
+# The one rule that keeps pull_request_target safe: NEVER run code from the PR.
+#   - We check out base `main`, so tools/modindex.py is OURS, not the submitter's.
+#     A submitter therefore cannot alter the validation logic or forge a result.
+#   - We overlay ONLY the PR's submissions/ (data), never its code.
+#   - The tool downloads the URLs a submission names, but the downloader refuses
+#     non-https and non-public hosts (_assert_safe_to_fetch in modindex.py), so a
+#     submission cannot turn that into a file:// read or an SSRF against the
+#     secret-bearing runner.
+
+on:
+  pull_request_target:
+    paths:
+      - "submissions/**"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out base repo (trusted tooling)
+        uses: actions/checkout@v4
+        # Default ref is the base branch (main). Do NOT set ref to the PR head:
+        # that would run the submitter's code with our secrets.
+
+      - name: Enforce single-file submission (fork PRs)
+        id: shape
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const isFork = pr.head.repo && pr.head.repo.full_name !== pr.base.repo.full_name;
+            if (!isFork) {
+              core.info('Same-repo PR; the single-file submission gate does not apply.');
+              core.setOutput('ok', 'true');
+              return;
+            }
+            const { owner, repo } = context.repo;
+            const files = await github.paginate(github.rest.pulls.listFiles,
+              { owner, repo, pull_number: pr.number, per_page: 100 });
+            const problems = [];
+            const added = files.filter(f => f.status === 'added');
+            if (files.length !== 1 || added.length !== 1) {
+              problems.push(
+                'A submission PR from a fork must add exactly one file and change ' +
+                'nothing else. This PR touches ' + files.length + ' file(s): ' +
+                files.map(f => f.filename + ' (' + f.status + ')').join(', ') + '.');
+            }
+            const pathRe = /^submissions\/[^/]+\/\d+\.\d+\.\d+\.json$/;
+            for (const f of added) {
+              if (!pathRe.test(f.filename)) {
+                problems.push(
+                  f.filename + ' is not a valid submission path. Expected ' +
+                  'submissions/<author>.<repo>/<version>.json.');
+              }
+            }
+            if (problems.length) {
+              require('fs').writeFileSync('shape-problems.txt', problems.join('\n') + '\n');
+              core.setOutput('ok', 'false');
+            } else {
+              core.setOutput('ok', 'true');
+            }
+
+      - name: Overlay the PR's submission manifests (data only, never code)
+        if: steps.shape.outputs.ok == 'true'
+        env:
+          PR_REF: refs/pull/${{ github.event.pull_request.number }}/head
+        run: |
+          set -e
+          git fetch --no-tags --depth=1 origin "$PR_REF"
+          # Restore ONLY submissions/ from the PR head onto the base tree. tools/
+          # and everything else stay at base, so no PR-supplied code can run.
+          git checkout FETCH_HEAD -- submissions
+          echo "Submission files now under review:"
+          git status --porcelain -- submissions || true
+
+      - uses: actions/setup-python@v5
+        if: steps.shape.outputs.ok == 'true'
+        with:
+          python-version: "3.x"
+
+      - name: Validate submissions
+        id: validate
+        if: steps.shape.outputs.ok == 'true'
+        # Capture the output and exit code without failing the step, so the
+        # comment is posted either way; the final step re-raises a failure to
+        # keep the check red. On a fork PR with no VIRUSTOTAL_API_KEY the VT scan
+        # reports as skipped; structure and hashes are always checked.
+        env:
+          VIRUSTOTAL_API_KEY: ${{ secrets.VIRUSTOTAL_API_KEY }}
+        run: |
+          set +e
+          python tools/modindex.py validate > validate-output.txt 2>&1
+          rc=$?
+          cat validate-output.txt
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Post or update the PR comment
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- modindex-validation -->';
+            let head, details = '';
+            if (fs.existsSync('shape-problems.txt')) {
+              const probs = fs.readFileSync('shape-problems.txt', 'utf8').trim().split('\n');
+              head = '## Submission checks: FAILED\n\n' + probs.map(p => '- ' + p).join('\n');
+            } else {
+              const rc = '${{ steps.validate.outputs.rc }}';
+              const output = fs.existsSync('validate-output.txt')
+                ? fs.readFileSync('validate-output.txt', 'utf8') : '(no output)';
+              head = rc === '0'
+                ? '## Submission checks: PASSED\n\nAutomated Layer 1 checks passed. A maintainer still reviews this before it can merge.'
+                : '## Submission checks: FAILED\n\nPlease fix the items below, then push an update to this PR. The checks re-run automatically.';
+              details = '\n\n<details><summary>Validation output</summary>\n\n```\n' + output + '\n```\n\n</details>';
+            }
+            const body = marker + '\n' + head + details;
+            const { owner, repo } = context.repo;
+            const prNum = context.payload.pull_request.number;
+            const { data: comments } = await github.rest.issues.listComments(
+              { owner, repo, issue_number: prNum, per_page: 100 });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number: prNum, body });
+            }
+
+      - name: Reflect result in the check status
+        if: always()
+        run: |
+          if [ "${{ steps.shape.outputs.ok }}" != "true" ]; then
+            echo "Single-file submission gate failed."; exit 1
+          fi
+          if [ "${{ steps.validate.outputs.rc }}" != "0" ]; then
+            echo "Validation failed."; exit 1
+          fi
+          echo "All checks passed."

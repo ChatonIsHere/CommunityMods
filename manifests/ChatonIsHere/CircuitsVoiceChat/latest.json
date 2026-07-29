@@ -1,0 +1,22 @@
+{
+  "manifest_version": 1,
+  "id": "ChatonIsHere.CircuitsVoiceChat",
+  "name": "Circuits Voice Chat",
+  "version": "1.0.4",
+  "author": "ChatonIsHere",
+  "description": "Proximity voice chat for A Township Tale.",
+  "client_side": true,
+  "server_side": true,
+  "dependencies": {},
+  "library_dependencies": [
+    {
+      "name": "Concentus",
+      "download_url": "https://github.com/ChatonIsHere/CircuitsVoiceChat/releases/download/v1.0.4/Concentus.dll",
+      "sha256": "b536a1e869d447147333864451c51ceab4804957857dd97914751fba32ebe0cc",
+      "filename": "Concentus.dll"
+    }
+  ],
+  "download_url": "https://github.com/ChatonIsHere/CircuitsVoiceChat/releases/download/v1.0.4/CircuitsVoiceChat-v1.0.4.dll",
+  "sha256": "7a3eccb05749743515dfeb433ac19b6570f197ad8f8459a958d6f31693142488",
+  "package": "dll"
+}
