@@ -1,33 +1,24 @@
 name: Validate submissions
 
-# Layer 1 of the trust model (see docs/SUBMITTING.md): every pull request that
-# adds or changes a submission is checked mechanically before a human reviews it.
-# This gate does NOT merge anything; it tells the maintainer and submitter whether
-# the structure, ownership, and hashes are sound, surfaces the VirusTotal result,
-# and posts the outcome as a PR comment (pass or fail).
+# Layer 1 of the trust model (docs/SUBMITTING.md): checks every submission PR
+# mechanically and posts the result as a PR comment. Does not merge anything.
 #
-# It enforces two things before it trusts a fork's PR:
-#   1. Shape: a fork PR must ADD exactly one file, the new manifest under
-#      submissions/<author>.<repo>/<version>.json, and change nothing else. That
-#      stops a submission from smuggling in edits to tooling, workflows, the
-#      index, or another mod's manifest. Same-repo (maintainer) PRs are exempt,
-#      since they are trusted and reviewed and sometimes need multi-file changes.
+# Checks two things:
+#   1. Shape: a fork PR must add exactly one file, the new manifest under
+#      submissions/<author>.<repo>/<version>.json, and change nothing else.
+#      Stops a submission from smuggling in edits to tooling, workflows, the
+#      index, or another mod's manifest. Same-repo (maintainer) PRs are exempt.
 #   2. Content: structure, ownership, hashes, and VirusTotal (via modindex.py).
 #
-# SECURITY - why this uses pull_request_target:
-# A plain pull_request run from a fork gets a read-only token and no secrets, so
-# it can neither run VirusTotal nor comment. pull_request_target instead runs in
-# the BASE repo's context, where the secret (VIRUSTOTAL_API_KEY) and a write token
-# are available - that is what makes VT and the comment work for fork PRs too.
-#
-# The one rule that keeps pull_request_target safe: NEVER run code from the PR.
-#   - We check out base `main`, so tools/modindex.py is OURS, not the submitter's.
-#     A submitter therefore cannot alter the validation logic or forge a result.
-#   - We overlay ONLY the PR's submissions/ (data), never its code.
-#   - The tool downloads the URLs a submission names, but the downloader refuses
-#     non-https and non-public hosts (_assert_safe_to_fetch in modindex.py), so a
-#     submission cannot turn that into a file:// read or an SSRF against the
-#     secret-bearing runner.
+# Uses pull_request_target so a fork PR still gets VIRUSTOTAL_API_KEY and a
+# write token for the comment; a plain pull_request run from a fork gets neither.
+# To keep that safe:
+#   - Checkout is base `main`, so tools/modindex.py is always ours, never the
+#     submitter's.
+#   - Only the PR's submissions/ (data) is overlaid, never its code.
+#   - The downloader (_assert_safe_to_fetch in modindex.py) refuses non-https
+#     and non-public hosts, so a submission can't turn its download_url into a
+#     file:// read or an SSRF against the secret-bearing runner.
 
 on:
   pull_request_target:
@@ -44,8 +35,8 @@ jobs:
     steps:
       - name: Check out base repo (trusted tooling)
         uses: actions/checkout@v4
-        # Default ref is the base branch (main). Do NOT set ref to the PR head:
-        # that would run the submitter's code with our secrets.
+        # Default ref is the base branch (main), not the PR head, so submitter
+        # code never runs with our secrets.
 
       - name: Enforce single-file submission (fork PRs)
         id: shape
@@ -92,8 +83,8 @@ jobs:
         run: |
           set -e
           git fetch --no-tags --depth=1 origin "$PR_REF"
-          # Restore ONLY submissions/ from the PR head onto the base tree. tools/
-          # and everything else stay at base, so no PR-supplied code can run.
+          # Restore only submissions/ from the PR head onto the base tree.
+          # tools/ and everything else stay at base.
           git checkout FETCH_HEAD -- submissions
           echo "Submission files now under review:"
           git status --porcelain -- submissions || true
@@ -106,10 +97,8 @@ jobs:
       - name: Validate submissions
         id: validate
         if: steps.shape.outputs.ok == 'true'
-        # Capture the output and exit code without failing the step, so the
-        # comment is posted either way; the final step re-raises a failure to
-        # keep the check red. On a fork PR with no VIRUSTOTAL_API_KEY the VT scan
-        # reports as skipped; structure and hashes are always checked.
+        # Capture output and exit code without failing the step, so the comment
+        # step always runs; the final step fails the check if validation failed.
         env:
           VIRUSTOTAL_API_KEY: ${{ secrets.VIRUSTOTAL_API_KEY }}
         run: |

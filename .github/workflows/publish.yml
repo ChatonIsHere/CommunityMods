@@ -1,9 +1,8 @@
 name: Publish index
 
-# Runs after a maintainer merges an approved submission to main. Ingests any
-# submissions/ manifests into manifests/<author>/<repo>/, regenerates the
-# latest*.json pointers and repository.json, and commits the result back.
-# Submitters never hand-edit the index.
+# Runs after a submission merges to main. Ingests submissions/ manifests into
+# manifests/<author>/<repo>/, regenerates the latest*.json pointers and
+# repository.json, and commits the result.
 
 on:
   push:
@@ -14,20 +13,16 @@ on:
       - "tools/**"
   workflow_dispatch:
 
-# The push below goes to main, which is protected (PRs required). The default
-# GITHUB_TOKEN (github-actions[bot]) is not on the ruleset bypass list, so it
-# would be rejected. Instead we mint a token from a dedicated GitHub App that IS
-# on the bypass list, and push as that app. Needs two secrets: PUBLISH_APP_ID and
-# PUBLISH_APP_PRIVATE_KEY (the app's private key .pem). The app only needs
-# Contents: Read and write on this repo.
+# main is protected, so the default GITHUB_TOKEN can't push here. Uses a token
+# from a dedicated GitHub App that's on the ruleset bypass list instead. Needs
+# two secrets: PUBLISH_APP_ID and PUBLISH_APP_PRIVATE_KEY (the app's private key
+# .pem). The app only needs Contents: Read and write on this repo.
 permissions:
   contents: read
 
-# Serialize index builds: at most one runs at a time. A run in progress is never
-# cancelled (cancel-in-progress: false); newer pushes queue behind it. So two
-# Actions can never edit manifests/ or repository.json at once. Each build is a
-# full rebuild from the committed tree, so the last run to execute still picks up
-# every merged submission even if a queued run gets superseded.
+# Serializes index builds so two runs never edit manifests/ or repository.json
+# at once. Runs queue rather than cancel, since each build is a full rebuild and
+# still picks up every merged submission even after a queued run is superseded.
 concurrency:
   group: publish-index
   cancel-in-progress: false
@@ -45,8 +40,8 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
-          # Persist this token as the git credential so the commit + push below
-          # are made by the app, which bypasses branch protection.
+          # Use the app token as the git credential so the commit and push
+          # below are made by the app, bypassing branch protection.
           token: ${{ steps.app-token.outputs.token }}
 
       - uses: actions/setup-python@v5
@@ -66,10 +61,8 @@ jobs:
             exit 0
           fi
           git commit -m "chore(index): rebuild after merge"
-          # The concurrency group already rules out a competing publish run. This
-          # loop only guards the rare case of a NON-publish commit (a human, or
-          # another workflow) landing on main between our checkout and push:
-          # rebase onto it, rebuild from the combined tree (idempotent), retry.
+          # Guards the rare case of another commit landing on main between our
+          # checkout and push: rebase onto it, rebuild, and retry.
           for attempt in 1 2 3 4 5; do
             if git push; then
               echo "pushed on attempt $attempt"
