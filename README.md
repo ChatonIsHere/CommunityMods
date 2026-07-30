@@ -1,6 +1,6 @@
 # CommunityMods
 
-The default mod index for The Modding Tavern modding through TavernLauncher. Every launcher will hopefully trust this repo out of the box, so you can browse and install what's here straight from the **Mods > Community Mods** menu with no setup.
+The default mod index for The Modding Tavern modding through TavernLauncher. Every launcher trusts this repo out of the box, so you can browse and install what's here straight from the **Community Mods** menu with no setup.
 
 Nothing here runs. It's a set of static JSON files that say where each mod's files live (in the mods' own GitHub releases) and how to install them. The launcher reads them directly, so any plain static host works and there's no backend to keep alive.
 
@@ -32,4 +32,4 @@ The launcher reads any repo that serves the layout in [docs/REPO_STRUCTURE.md](d
 
 - This repo: structural validation, a VirusTotal scan of every file, and a maintainer's review before anything merges. Trusted by launchers by default.
 - A source you add yourself: no review, shown as unverified. You vet it.
-- Every install, from any source, is hash-checked against the manifest before it's written, scanned by your local antivirus when one is available, and can only ever land in `Mods/` or `UserLibs/`.
+- Every install, from any source, is hash-checked against the manifest before it's written, and can only ever land in `Mods/` or `UserLibs/`. The hash check is what ties the file you install to the one that was scanned and reviewed here.
