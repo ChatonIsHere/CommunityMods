@@ -1,15 +1,15 @@
 {
-  "manifest_version": 1,
-  "id": "CircuitLord.FastTale",
-  "name": "FastTale",
-  "version": "1.0.3",
-  "author": "CircuitLord",
-  "description": "Performance mod for A Township Tale (MelonLoader).",
-  "client_side": true,
-  "server_side": false,
-  "dependencies": {},
-  "library_dependencies": [],
-  "download_url": "https://github.com/CircuitLord/FastTale/releases/download/v1.0.3/FastTale-v1.0.3.dll",
-  "sha256": "2c1438f4ddaaaa94692500656bfa2d9507c6e9cd976576e068caea99d896802c",
-  "package": "dll"
+    "manifest_version": 1,
+    "id": "CircuitLord.FastTale",
+    "name": "FastTale",
+    "version": "1.0.3",
+    "author": "CircuitLord",
+    "description": "Performance mod for A Township Tale (MelonLoader).",
+    "client_side": true,
+    "server_side": true,
+    "dependencies": {},
+    "library_dependencies": [],
+    "download_url": "https://github.com/CircuitLord/FastTale/releases/download/v1.0.3/FastTale-v1.0.3.dll",
+    "sha256": "2c1438f4ddaaaa94692500656bfa2d9507c6e9cd976576e068caea99d896802c",
+    "package": "dll"
 }
