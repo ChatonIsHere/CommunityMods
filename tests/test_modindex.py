@@ -102,6 +102,32 @@ class Structure(unittest.TestCase):
             with self.assertRaises(mi.ValidationError):
                 mi.parse_id(bad)
 
+    def test_valid_dependencies_pass(self):
+        self.assertEqual(mi.validate_structure(
+            manifest(dependencies={"Other.Kit": "1.2.0", "Third.Party": "2.0.1"})), [])
+
+    def test_dependency_entries_are_validated_not_just_the_container(self):
+        # Both halves of every entry: the key feeds by-id manifest resolution,
+        # the value feeds major-lock version resolution. A malformed one has to
+        # fail here, where the submitter sees it, not at install time on a user's
+        # machine as an unresolvable mod with no clue which manifest is at fault.
+        cases = {
+            "id with no dot": manifest(dependencies={"nodot": "1.0.0"}),
+            "id with traversal": manifest(dependencies={"../../evil": "1.0.0"}),
+            "id with a path separator": manifest(dependencies={"Owner./evil": "1.0.0"}),
+            "two-segment version": manifest(dependencies={"Other.Kit": "1.2"}),
+            "non-numeric version": manifest(dependencies={"Other.Kit": "banana"}),
+            "prerelease version": manifest(dependencies={"Other.Kit": "1.2.0-rc1"}),
+            "non-string version": manifest(dependencies={"Other.Kit": 1}),
+        }
+        for label, m in cases.items():
+            with self.subTest(label):
+                self.assertTrue(mi.validate_structure(m), f"{label} should have failed")
+
+    def test_self_dependency_rejected(self):
+        errs = mi.validate_structure(manifest("Owner.Repo", dependencies={"Owner.Repo": "1.0.0"}))
+        self.assertTrue(any("own id" in e for e in errs), errs)
+
 
 class InspectZipBundle(unittest.TestCase):
     """The package="zip" content checks, run on the downloaded archive."""

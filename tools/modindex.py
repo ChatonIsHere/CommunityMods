@@ -234,8 +234,28 @@ def validate_structure(m):
         if key in m and not isinstance(m[key], bool):
             errs.append(f"{key} must be a boolean")
 
-    if not isinstance(m.get("dependencies", {}), dict):
+    deps = m.get("dependencies", {})
+    if not isinstance(deps, dict):
         errs.append("dependencies must be an object (use {} when none)")
+    else:
+        # Both halves of every entry, and the container. A dependency id
+        # is fed straight into the launcher's by-id manifest fetch and its
+        # value into major-lock resolution, so a malformed one here is not
+        # caught until an installing user hits an unresolvable error with no
+        # idea which manifest is at fault. Same rules the mod's own id and
+        # version answer to.
+        for dep_id, min_version in deps.items():
+            try:
+                parse_id(dep_id)
+            except ValidationError as e:
+                errs.append(f"dependencies key {dep_id!r} is not a valid mod id: {e}")
+            if not isinstance(min_version, str) or not VERSION_RE.match(min_version):
+                errs.append(
+                    f"dependencies[{dep_id!r}] minimum version {min_version!r} must be "
+                    f"exactly MAJOR.MINOR.PATCH (three integers)")
+            elif dep_id == mod_id:
+                errs.append(f"dependencies lists {dep_id!r}, the mod's own id; "
+                            f"a mod can't depend on itself")
 
     # A mod has no `filename`, it installs as Mods/<id>/<id>.dll (single dll) or
     # the zip names its own files. Only `library_dependencies[].filename` matters
