@@ -12,6 +12,42 @@
           "1.0.4"
         ]
       }
+    },
+    "CircuitLord.FastTale": {
+      "1": {
+        "name": "FastTale",
+        "author": "CircuitLord",
+        "description": "Performance mod for A Township Tale (MelonLoader).",
+        "client_side": true,
+        "server_side": false,
+        "versions": [
+          "1.0.3"
+        ]
+      }
+    },
+    "Foxydemon88.Foxys-Flatscreen": {
+      "1": {
+        "name": "Foxy's Flatscreen",
+        "author": "Foxydemon88",
+        "description": "A flatscreen VR emulator mod for TavernLib.",
+        "client_side": true,
+        "server_side": false,
+        "versions": [
+          "1.0.5"
+        ]
+      }
+    },
+    "MrDuckTheFifth.ATT_Hardcore": {
+      "1": {
+        "name": "ATT Hardcore",
+        "author": "MrDuckTheFifth",
+        "description": "A server-sided perma death mod for A Township Tale.",
+        "client_side": false,
+        "server_side": true,
+        "versions": [
+          "1.0.0"
+        ]
+      }
     }
   }
 }

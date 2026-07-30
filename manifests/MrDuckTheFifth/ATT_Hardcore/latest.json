@@ -1,0 +1,15 @@
+{
+  "manifest_version": 1,
+  "id": "MrDuckTheFifth.ATT_Hardcore",
+  "name": "ATT Hardcore",
+  "version": "1.0.0",
+  "author": "MrDuckTheFifth",
+  "description": "A server-sided perma death mod for A Township Tale.",
+  "client_side": false,
+  "server_side": true,
+  "dependencies": {},
+  "library_dependencies": [],
+  "download_url": "https://github.com/MrDuckTheFifth/ATT_Hardcore/releases/download/Release/ATT_Hardcore.dll",
+  "sha256": "b6a9904dea746b8f84b3f9ff27b9675cae3896ee3a59f9fa6799e42e8df613f3",
+  "package": "dll"
+}

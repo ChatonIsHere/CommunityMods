@@ -1,0 +1,15 @@
+{
+    "manifest_version": 1,
+    "id": "Foxydemon88.Foxys-Flatscreen",
+    "name": "Foxy's Flatscreen",
+    "version": "1.0.5",
+    "author": "Foxydemon88",
+    "description": "A flatscreen VR emulator mod for TavernLib.",
+    "client_side": true,
+    "server_side": false,
+    "dependencies": {},
+    "library_dependencies": [],
+    "download_url": "https://github.com/Foxydemon88/Foxys-Flatscreen/releases/download/v1.0.5/FlatscreenATTMod.dll",
+    "sha256": "3b2b9310dc798eafb1e3bcac0e7fc60f501eaa4b218b486b296d15e20377ef8a",
+    "package": "dll"
+}
