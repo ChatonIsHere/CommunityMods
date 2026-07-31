@@ -2,13 +2,15 @@
   "manifest_version": 1,
   "id": "ChatonIsHere.CircuitsVoiceChat",
   "name": "Circuits Voice Chat",
-  "version": "1.0.4",
+  "version": "1.1.0",
   "author": "ChatonIsHere",
   "description": "Proximity voice chat for A Township Tale.",
   "client_side": true,
   "server_side": true,
   "parity_required": true,
-  "dependencies": {},
+  "dependencies": {
+    "CircuitLord.FastTale": "1.0.3"
+  },
   "library_dependencies": [
     {
       "name": "Concentus",
