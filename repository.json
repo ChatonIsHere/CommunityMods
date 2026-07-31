@@ -10,7 +10,8 @@
         "server_side": true,
         "parity_required": true,
         "versions": [
-          "1.0.4"
+          "1.0.4",
+          "1.1.0"
         ]
       }
     },
