@@ -7,6 +7,7 @@
   "description": "Proximity voice chat for A Township Tale.",
   "client_side": true,
   "server_side": true,
+  "parity_required": true,
   "dependencies": {},
   "library_dependencies": [
     {

@@ -42,6 +42,7 @@ Folder names come from the id, so they aren't free-form. See the id rule below.
         "description": "Does something useful.",
         "client_side": true,
         "server_side": true,
+        "parity_required": true,      // see the manifest table
         "versions": ["1.0.0", "1.2.0"]   // every release in this major
       },
       ...
@@ -53,7 +54,7 @@ Folder names come from the id, so they aren't free-form. See the id rule below.
 
 `index_version` is the schema version of this index file. It's separate from the `manifest_version` on the per-version manifests below: the index and the manifest are different schemas and version independently, so a launcher that doesn't recognise the index version skips the whole file rather than mis-reading it.
 
-Under `mods`, keyed by id, then by major version as a string. One entry per major. A mod with 1.4.0 and 2.1.0 out has both a `"1"` and a `"2"` entry, because a dependency locked to major 1 still has to resolve after major 2 ships. Each entry carries the discovery fields (`name`, `author`, `description`, `client_side`, `server_side`, taken from the highest release in that major) and `versions`, the list of every release in the major. The highest is `max(versions)`; that's the default install, and resolution picks the highest version at or above a dependency's minimum. The full manifest for any of those versions is one fetch away at `manifests/<author>/<repo>/<version>.json`.
+Under `mods`, keyed by id, then by major version as a string. One entry per major. A mod with 1.4.0 and 2.1.0 out has both a `"1"` and a `"2"` entry, because a dependency locked to major 1 still has to resolve after major 2 ships. Each entry carries the discovery fields (`name`, `author`, `description`, `client_side`, `server_side`, `parity_required`, taken from the highest release in that major) and `versions`, the list of every release in the major. The highest is `max(versions)`; that's the default install, and resolution picks the highest version at or above a dependency's minimum. The full manifest for any of those versions is one fetch away at `manifests/<author>/<repo>/<version>.json`.
 
 ## Manifest
 
@@ -71,6 +72,7 @@ This is the shape of the per-version files and the `latest*.json` pointers (not 
 
     "client_side": true,
     "server_side": true,
+    "parity_required": true,
 
     "dependencies": {
         "SomeDev.UtilKit": "1.2.0",
@@ -107,6 +109,7 @@ The launcher's parser enforces all of these.
 | `author`                      | Display author. Defaults to the text before the first dot in `id`.                                                                                                                                                                                                                                          |
 | `description`                 | Free text.                                                                                                                                                                                                                                                                                                  |
 | `client_side` / `server_side` | Booleans, at least one `true`. Controls which browse list the mod shows up in. The client launcher lists client-side mods, the server launcher lists server-side ones.                                                                                                                                      |
+| `parity_required`             | **Required.** Boolean: whether a client joining a server that runs this mod must match its exact version. `true` means the server refuses the join otherwise — for mods whose two halves are one system, like a voice codec or a network protocol, where a mismatch breaks the session outright. `false` means the server never blocks a join over it; the client is offered the mod, defaulted to installing, and can decline — for mods whose halves work independently, like a client performance tweak that happens to ship a server piece. Every manifest has to state it, so publishing is a deliberate answer rather than something inherited by omission. Only a real `false` relaxes it, so a malformed value reads as required; and where the field can legitimately be absent (an install record written before it existed, an older server's handshake entry) readers default it to `true` for the same reason. Only meaningful on a mod that is both `client_side` and `server_side`: a client-only mod is never in a server's list, and a server-only one is never asked of a client. |
 | `dependencies`                | `{}` or a map of other mod ids to a minimum version. Resolved by minimum-required-version with a major lock: candidates in the same major at or above the minimum, highest one wins. Always present, use `{}` for none.                                                                                     |
 | `library_dependencies`        | `[]` or a list of pinned third-party files (below). Always present, use `[]` for none.                                                                                                                                                                                                                      |
 | `package`                     | **Tooling-set, not submitter-written.** `"dll"` (`download_url` is the mod's single `.dll`) or `"zip"` (an archive extracted into the mod's folder, for a mod that ships several DLLs and/or Unity asset bundles / addressables). Determined by sniffing the file's own bytes during validation/ingest and baked into the compiled manifest (a zip starts with `PK`, anything else is a dll), so it can never disagree with the actual file. An unrecognised value in a compiled manifest skips it, same as an unknown `manifest_version`. |

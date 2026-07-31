@@ -64,10 +64,26 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 # cleanly against hand-written ones and against each other.
 _MANIFEST_ORDER = [
     "manifest_version", "id", "name", "version", "author", "description",
-    "client_side", "server_side", "dependencies", "library_dependencies",
-    "download_url", "sha256", "package",
+    "client_side", "server_side", "parity_required", "dependencies",
+    "library_dependencies", "download_url", "sha256", "package",
 ]
 _LIB_ORDER = ["name", "download_url", "sha256", "filename"]
+
+
+def parity_required(m, default=True):
+    """Whether a client joining a server that runs this mod must match its exact
+    version, read off a manifest or an index entry.
+
+    True (the default) for mods where both halves are one system and a mismatch
+    breaks the session outright - a voice codec, a network protocol, anything
+    where the two sides exchange data they both have to understand. False for
+    mods whose halves work independently, where the server won't block a join
+    and the client is offered the mod rather than obliged to have it.
+
+    Only a literal false relaxes it. A missing key, a null, or a string "false"
+    all read as required, so neither an older manifest nor a malformed one from
+    an unreviewed source can quietly drop a guarantee the server depends on."""
+    return m.get("parity_required", default) is not False
 
 # A mod's download_url is a single assembly ("dll") or an archive extracted into
 # Mods/<id>/ ("zip"). Must match modmanager.ModManifest.package. Set by the
@@ -190,6 +206,9 @@ def summary_entry(highest_manifest, versions_in_major):
         "description": m.get("description", ""),
         "client_side": bool(m.get("client_side", False)),
         "server_side": bool(m.get("server_side", False)),
+        # Carried in the index too, so a launcher can tell a required mod from a
+        # recommended one while browsing, without fetching every manifest.
+        "parity_required": parity_required(m),
         "versions": versions_in_major,
     }
 
@@ -233,6 +252,26 @@ def validate_structure(m):
     for key in ("client_side", "server_side"):
         if key in m and not isinstance(m[key], bool):
             errs.append(f"{key} must be a boolean")
+
+    if "parity_required" not in m:
+        # Mandatory rather than defaulted, so publishing a mod is a deliberate
+        # answer to "must a joining client match this exactly?" rather than
+        # something inherited by omission. The readers still default it to true
+        # wherever it can legitimately be absent (an install record written
+        # before the field existed, an older server's handshake entry).
+        errs.append("parity_required is required: true if a client joining a "
+                    "server that runs this mod must have this exact version, "
+                    "false if the server should not block the join over it")
+    else:
+        if not isinstance(m["parity_required"], bool):
+            errs.append("parity_required must be a boolean")
+        elif m["parity_required"] is False and not (
+                m.get("client_side") is True and m.get("server_side") is True):
+            # Nothing to relax otherwise: a client-only mod is never in a
+            # server's list, and a server-only mod is never asked of a client.
+            # Setting it false there reads like it does something.
+            errs.append("parity_required false only means anything on a mod that "
+                        "is both client_side and server_side")
 
     deps = m.get("dependencies", {})
     if not isinstance(deps, dict):

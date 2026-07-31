@@ -7,6 +7,7 @@
   "description": "A server-sided perma death mod for A Township Tale.",
   "client_side": false,
   "server_side": true,
+  "parity_required": true,
   "dependencies": {},
   "library_dependencies": [],
   "download_url": "https://github.com/MrDuckTheFifth/ATT_Hardcore/releases/download/Release/ATT_Hardcore.dll",

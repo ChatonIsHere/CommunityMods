@@ -33,6 +33,7 @@ def manifest(mod_id="Owner.Repo", version="1.0.0", **over):
         "description": "",
         "client_side": True,
         "server_side": True,
+        "parity_required": True,
         "dependencies": {},
         "library_dependencies": [],
         "download_url": f"https://github.com/{author}/{repo}/releases/download/v{version}/{repo}.dll",
@@ -127,6 +128,59 @@ class Structure(unittest.TestCase):
     def test_self_dependency_rejected(self):
         errs = mi.validate_structure(manifest("Owner.Repo", dependencies={"Owner.Repo": "1.0.0"}))
         self.assertTrue(any("own id" in e for e in errs), errs)
+
+    # parity_required: whether a client joining a server running this mod
+    # must match its exact version.
+
+    def test_parity_required_must_be_stated(self):
+        """Mandatory, so publishing is a deliberate answer to 'must a joining
+        client match this exactly?' rather than something inherited silently."""
+        m = manifest()
+        m.pop("parity_required", None)
+        errs = mi.validate_structure(m)
+        self.assertTrue(any("parity_required is required" in e for e in errs), errs)
+
+    def test_both_boolean_values_accepted(self):
+        for value in (True, False):
+            self.assertEqual(mi.validate_structure(manifest(parity_required=value)), [], value)
+
+    def test_non_boolean_parity_required_rejected(self):
+        for bad in ("required", "false", 0, 1, None, []):
+            errs = mi.validate_structure(manifest(parity_required=bad))
+            self.assertTrue(any("parity_required" in e for e in errs), (bad, errs))
+
+    def test_reader_only_relaxes_on_a_real_false(self):
+        """Fail closed: a missing key, a null, or a string all read as required,
+        so nothing malformed can quietly drop a guarantee a server depends on."""
+        self.assertTrue(mi.parity_required({}))
+        for bad in ("false", "", None, 0, "optional"):
+            self.assertTrue(mi.parity_required({"parity_required": bad}), bad)
+        self.assertFalse(mi.parity_required({"parity_required": False}))
+
+    def test_false_needs_both_sides(self):
+        """Nothing to relax on a one-sided mod: a client-only mod is never in a
+        server's list, a server-only one is never asked of a client."""
+        for over in ({"server_side": False}, {"client_side": False}):
+            errs = mi.validate_structure(manifest(parity_required=False, **over))
+            self.assertTrue(any("both client_side and server_side" in e for e in errs),
+                            (over, errs))
+
+    def test_true_is_fine_on_a_one_sided_mod(self):
+        # It's the default, so it can't be an error to say it out loud.
+        self.assertEqual(
+            mi.validate_structure(manifest(parity_required=True, server_side=False)), [])
+
+    def test_summary_still_defaults_a_missing_value_to_required(self):
+        """summary_entry runs on already-validated manifests, so this can't
+        normally happen - but the index must never emit a relaxed value it
+        wasn't told to, so the reader stays fail-closed underneath."""
+        m = manifest()
+        m.pop("parity_required", None)
+        self.assertIs(mi.summary_entry(m, ["1.0.0"])["parity_required"], True)
+
+    def test_summary_carries_parity_through(self):
+        entry = mi.summary_entry(manifest(parity_required=False), ["1.0.0"])
+        self.assertIs(entry["parity_required"], False)
 
 
 class InspectZipBundle(unittest.TestCase):
