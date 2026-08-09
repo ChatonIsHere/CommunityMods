@@ -125,6 +125,12 @@ Two separate things:
 
 Two mods pinning the same `filename` with the same `sha256` install it once. The same `filename` with a different `sha256` is a conflict, and neither installs.
 
+**Dependencies are resolved per side.** When the launcher installs a mod's dependency closure it knows whether it's installing into a client or a server, and it leaves out any dependency that can't run there, along with anything only that dependency needed. So a mod that runs on **both** sides may depend on a **client-only** mod: the client gets it, the server doesn't, and neither has to be told about the other. This is the supported way to say "my client half needs this" — there is no per-side `dependencies` field, and none is needed.
+
+What that costs you: the tooling can't tell whether your *server* half also touches that dependency, because no manifest states it and only your assembly knows. If it does, your server half won't load, and the dependency wouldn't have saved it (it can't run on a server either) — that's a mod bug, not a resolution one. A submission in this shape gets a note asking you to confirm, not a rejection.
+
+What **is** rejected: a dependency whose sides don't overlap with yours at all — a server-only mod depending on a client-only mod, or the reverse. That edge can never be satisfied in any process the mod runs in, so it's a dead relationship rather than a per-side one.
+
 **What goes in the zip vs. a `library_dependency`:** put the mod's own code (even several managed DLLs) plus its Unity asset bundles / addressables in the `package:"zip"` archive. Put anything third-party or shared in `library_dependencies` so it's deduped and reference-counted in `UserLibs/` instead of duplicated in every mod that uses it. A **native/unmanaged DLL must be a `library_dependency`** regardless. MelonLoader only registers `UserLibs/` (not mod folders) as a native DLL search path, so a native DLL inside a mod folder won't be found.
 
 **The zip must have at least one `.dll` at its root.** The archive root becomes `Mods/<id>/`, and MelonLoader loads the assemblies sitting directly in that folder (`Mods/<id>/*.dll`), it does **not** recurse into subfolders looking for a mod to load. So your mod's main assembly (and any managed DLL you want MelonLoader to load) must be at the top level of the zip, not tucked inside a subfolder; asset-bundle subfolders alongside them are fine. The submission validator rejects a bundle whose only `.dll`s are in subfolders, because it would install cleanly and then silently never load.

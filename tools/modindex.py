@@ -343,6 +343,107 @@ def validate_structure(m):
     return errs
 
 
+def _side_set(m):
+    """The set of process kinds this mod can load in, from its own flags."""
+    sides = set()
+    if m.get("client_side") is True:
+        sides.add("client")
+    if m.get("server_side") is True:
+        sides.add("server")
+    return sides
+
+
+def _sides_text(sides):
+    return "+".join(sorted(sides)) if sides else "neither side"
+
+
+def _resolve_dep_in_repo(known, dep_id, min_version):
+    """The manifest the LAUNCHER's resolver would pick for this dependency:
+    highest version within min_version's major that is >= min_version. Mirrors
+    modmanager's Minimum-Required-Version-with-Major-Lock so this check reasons
+    about the same file an install would actually land on.
+
+    None if this repo doesn't carry it, which is not an error on its own -- a
+    dependency may legitimately live in another source the submitter's users
+    add themselves."""
+    versions = known.get(dep_id) or {}
+    major = min_version.split(".")[0]
+    key = _vkey(min_version)
+    candidates = [v for v in versions
+                  if v.split(".")[0] == major and _vkey(v) >= key]
+    if not candidates:
+        return None
+    return versions[max(candidates, key=_vkey)]
+
+
+def validate_dependency_sides(m, known):
+    """The one rule that needs to see OTHER manifests: a dependency has to be
+    able to run somewhere the mod requiring it runs. Returns (errs, warns).
+
+    Error only when the two side sets are DISJOINT -- the dependency can never
+    be satisfied in any process this mod runs in, so the edge is dead wherever
+    you look at it. A server-only mod depending on a client-only mod is the
+    case; nothing can ever install them together.
+
+    Deliberately NOT an error when the sets merely differ: a mod that runs on
+    both sides, depending on a client-only mod, is the ordinary shape of "my
+    client half needs this" and is exactly what the launcher's side-filtered
+    resolution exists to serve. It draws a note instead, because the one thing
+    the tooling cannot check is whether the author *meant* the server half to
+    run without it -- no manifest states that, and reading it out of the
+    assembly is the only way to know. The note puts that question in front of a
+    human reviewer, which is where it can actually be answered."""
+    errs, warns = [], []
+    mine = _side_set(m)
+    for dep_id, min_version in sorted((m.get("dependencies") or {}).items()):
+        if not isinstance(min_version, str) or not VERSION_RE.match(min_version):
+            continue        # already reported by validate_structure
+        dep = _resolve_dep_in_repo(known, dep_id, min_version)
+        if dep is None:
+            warns.append(
+                f"dependency {dep_id} >= {min_version} isn't in this repository, "
+                f"so its client/server sides can't be checked here. If it lives "
+                f"in another source, users need that source added to install this.")
+            continue
+        theirs = _side_set(dep)
+        shared = mine & theirs
+        if not shared:
+            errs.append(
+                f"dependency {dep_id} {dep.get('version')} runs on "
+                f"{_sides_text(theirs)}, but this mod runs on {_sides_text(mine)}. "
+                f"They never share a process, so the dependency can't be "
+                f"satisfied anywhere this mod runs.")
+        elif shared != mine:
+            missing = _sides_text(mine - shared)
+            warns.append(
+                f"dependency {dep_id} {dep.get('version')} runs on "
+                f"{_sides_text(theirs)} only, so on the {missing} this mod will "
+                f"load without it. Fine if only the {_sides_text(shared)} half "
+                f"needs it -- the launcher leaves it out there rather than "
+                f"installing something that would fail to load. Make sure the "
+                f"{missing} half really doesn't touch it.")
+    return errs, warns
+
+
+def _known_manifests(root):
+    """id -> {version: manifest} from manifests/, WITHOUT re-validating each one.
+    _collect_manifests is the build path and is strict on purpose; this is for
+    validating a submission, where another mod's unrelated problem must not fail
+    the PR in front of us."""
+    known = {}
+    man_dir = os.path.join(root, "manifests")
+    for dirpath, _dirs, files in os.walk(man_dir):
+        for name in sorted(files):
+            if not name.endswith(".json") or name.startswith("latest"):
+                continue
+            try:
+                m = _load_json(os.path.join(dirpath, name))
+                known.setdefault(m["id"], {})[m["version"]] = m
+            except Exception:
+                continue
+    return known
+
+
 def _url_owned_by(url, author, repo):
     """True if url is a github.com release asset under <author>/<repo>
     (case-insensitively, GitHub owner/repo are case-insensitive)."""
@@ -754,6 +855,9 @@ def cmd_validate(args):
 
     api_key = os.environ.get("VIRUSTOTAL_API_KEY", "").strip() or None
     failures = 0
+    # Read once for the whole run: the side-compatibility rule is the only check
+    # that has to look at manifests other than the one being validated.
+    known = _known_manifests(root)
 
     for path in files:
         rel = os.path.relpath(path, root)
@@ -767,6 +871,13 @@ def cmd_validate(args):
 
         errs = validate_structure(m)
         warns = []
+
+        if not errs:
+            # After the structural pass, so a malformed dependency entry is
+            # reported once, by the check that owns it.
+            e, w = validate_dependency_sides(m, known)
+            errs += e
+            warns += w
 
         if not errs:
             e, w = _check_file(m["download_url"], m["sha256"], api_key,
@@ -902,6 +1013,23 @@ def cmd_build(args):
     moved = _ingest_submissions(root) if args.ingest else []
 
     mods = _collect_manifests(root)
+
+    # Repo-wide, not just the freshly-ingested submission: a dependency edge is a
+    # relationship between two manifests, so publishing a NEW version of a mod can
+    # invalidate an OLD version of something that depends on it. Only the compiler
+    # sees the whole graph at once, and it must not emit an index describing an
+    # unsatisfiable dependency.
+    side_errs = []
+    for mod_id in sorted(mods):
+        for version in sorted(mods[mod_id], key=_vkey):
+            errs, warns = validate_dependency_sides(mods[mod_id][version], mods)
+            side_errs += [f"{mod_id} {version}: {e}" for e in errs]
+            for w in warns:
+                print(f"note  {mod_id} {version}: {w}")
+    if side_errs:
+        raise ValidationError(
+            "dependency sides are unsatisfiable:\n  - " + "\n  - ".join(side_errs))
+
     repo_index = {"index_version": SUPPORTED_INDEX_MAJOR, "mods": {}}
 
     # An empty manifests/ tree is valid (a freshly published repo with no mods),
