@@ -542,5 +542,128 @@ class FillHashes(unittest.TestCase):
             mi._sha256_of_url = saved
 
 
+class DependencySides(unittest.TestCase):
+    """A dependency has to be able to run somewhere the mod requiring it runs.
+
+    The distinction this class exists to pin down: 'the sides differ' is normal
+    and allowed, 'the sides don't overlap at all' is a dead edge and rejected."""
+
+    def _known(self, *manifests):
+        known = {}
+        for m in manifests:
+            known.setdefault(m["id"], {})[m["version"]] = m
+        return known
+
+    def _check(self, m, *known):
+        return mi.validate_dependency_sides(m, self._known(*known))
+
+    # -- the shape that must keep working ------------------------------------
+
+    def test_dual_side_mod_may_depend_on_client_only_mod(self):
+        """The motivating case for side-filtered resolution. A mod running on
+        both sides whose client half needs a client-only support mod is normal,
+        not an error: the launcher leaves the dependency out on the server."""
+        dep = manifest("Dev.UIKit", "1.0.0", client_side=True, server_side=False)
+        mod = manifest("Dev.Dual", "1.0.0", dependencies={"Dev.UIKit": "1.0.0"})
+        errs, warns = self._check(mod, dep)
+        self.assertEqual(errs, [])
+        self.assertEqual(len(warns), 1)
+        self.assertIn("server", warns[0])       # names the side that goes without
+
+    def test_dual_side_mod_may_depend_on_server_only_mod(self):
+        dep = manifest("Dev.DbTools", "1.0.0", client_side=False, server_side=True)
+        mod = manifest("Dev.Dual", "1.0.0", dependencies={"Dev.DbTools": "1.0.0"})
+        errs, warns = self._check(mod, dep)
+        self.assertEqual(errs, [])
+        self.assertIn("client", warns[0])
+
+    def test_matching_sides_are_silent(self):
+        dep = manifest("Dev.Shared", "1.0.0")
+        mod = manifest("Dev.Mod", "1.0.0", dependencies={"Dev.Shared": "1.0.0"})
+        self.assertEqual(self._check(mod, dep), ([], []))
+
+    # -- the dead edges ------------------------------------------------------
+
+    def test_server_only_mod_depending_on_client_only_mod_is_rejected(self):
+        dep = manifest("Dev.UIKit", "1.0.0", client_side=True, server_side=False)
+        mod = manifest("Dev.Srv", "1.0.0", client_side=False, server_side=True,
+                       dependencies={"Dev.UIKit": "1.0.0"})
+        errs, warns = self._check(mod, dep)
+        self.assertEqual(len(errs), 1)
+        self.assertIn("never share a process", errs[0])
+
+    def test_client_only_mod_depending_on_server_only_mod_is_rejected(self):
+        dep = manifest("Dev.DbTools", "1.0.0", client_side=False, server_side=True)
+        mod = manifest("Dev.Cli", "1.0.0", client_side=True, server_side=False,
+                       dependencies={"Dev.DbTools": "1.0.0"})
+        self.assertEqual(len(self._check(mod, dep)[0]), 1)
+
+    # -- resolution ----------------------------------------------------------
+
+    def test_checks_the_version_the_launcher_would_install(self):
+        """Major-locked, highest >= the minimum - so a later, fixed release in
+        the same major is what gets judged, not the one the author named."""
+        bad = manifest("Dev.Kit", "1.0.0", client_side=True, server_side=False)
+        good = manifest("Dev.Kit", "1.5.0")          # both sides, and higher
+        mod = manifest("Dev.Srv", "1.0.0", client_side=False, server_side=True,
+                       dependencies={"Dev.Kit": "1.0.0"})
+        self.assertEqual(self._check(mod, bad, good), ([], []))
+
+    def test_other_major_is_not_consulted(self):
+        other = manifest("Dev.Kit", "2.0.0")         # fine, but wrong major
+        mod = manifest("Dev.Srv", "1.0.0", client_side=False, server_side=True,
+                       dependencies={"Dev.Kit": "1.0.0"})
+        errs, warns = self._check(mod, other)
+        self.assertEqual(errs, [])                   # unresolvable, so unjudged
+        self.assertIn("isn't in this repository", warns[0])
+
+    def test_dependency_from_another_source_is_a_note_not_an_error(self):
+        mod = manifest("Dev.Mod", "1.0.0", dependencies={"Someone.Else": "1.0.0"})
+        errs, warns = self._check(mod)
+        self.assertEqual(errs, [])
+        self.assertIn("isn't in this repository", warns[0])
+
+    def test_malformed_version_is_left_to_validate_structure(self):
+        mod = manifest("Dev.Mod", "1.0.0", dependencies={"Dev.Kit": "not-a-version"})
+        self.assertEqual(self._check(mod), ([], []))
+        self.assertTrue(mi.validate_structure(mod))   # reported there instead
+
+
+class BuildEnforcesDependencySides(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="modindex_sides_")
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.root, ignore_errors=True))
+        saved = mi._sniff_package_from_url
+        mi._sniff_package_from_url = lambda url: "dll"
+        self.addCleanup(lambda: setattr(mi, "_sniff_package_from_url", saved))
+
+    def _write_manifest(self, m):
+        author, repo = m["id"].split(".", 1)
+        mi._write_json(os.path.join(self.root, "manifests", author, repo,
+                                    f'{m["version"]}.json'), m)
+
+    def _build(self):
+        return mi.cmd_build(argparse.Namespace(repo=self.root, ingest=False, prune=False))
+
+    def test_build_refuses_to_index_an_unsatisfiable_edge(self):
+        self._write_manifest(manifest("Dev.UIKit", "1.0.0",
+                                      client_side=True, server_side=False))
+        self._write_manifest(manifest("Dev.Srv", "1.0.0",
+                                      client_side=False, server_side=True,
+                                      dependencies={"Dev.UIKit": "1.0.0"}))
+        with self.assertRaises(mi.ValidationError) as cm:
+            self._build()
+        self.assertIn("Dev.Srv", str(cm.exception))
+        self.assertFalse(os.path.isfile(os.path.join(self.root, "repository.json")))
+
+    def test_build_allows_a_dual_side_mod_with_a_client_only_dependency(self):
+        self._write_manifest(manifest("Dev.UIKit", "1.0.0",
+                                      client_side=True, server_side=False))
+        self._write_manifest(manifest("Dev.Dual", "1.0.0",
+                                      dependencies={"Dev.UIKit": "1.0.0"}))
+        self._build()
+        self.assertTrue(os.path.isfile(os.path.join(self.root, "repository.json")))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
