@@ -151,12 +151,17 @@ def _load_json(path):
 
 
 def _is_safe_basename(name):
-    """A bare filename: no directory part, not '.'/'..'/empty, no separators."""
+    """A bare filename: no directory part, not '.'/'..'/empty, no separators,
+    no colon. The colon matters on the launcher's platform specifically: it is
+    the drive separator, and on NTFS the alternate-data-stream separator, so
+    "mod.dll:payload" names a hidden stream rather than a file. Mirrors
+    modmanager's _safe_basename / TavernLib's SafeBasename."""
     return (
         isinstance(name, str)
         and name not in ("", ".", "..")
         and "/" not in name
         and "\\" not in name
+        and ":" not in name
         and os.path.basename(name) == name
     )
 
@@ -475,7 +480,15 @@ def _assert_safe_to_fetch(url):
     addresses. Blocks file:// reads and SSRF to loopback/private/link-local
     addresses, since validation runs in a context holding secrets (see
     .github/workflows/validate.yml). Raises ValidationError if the URL is
-    unsafe."""
+    unsafe.
+
+    Checks the resolution, not the connection, so a host that answers with a
+    public address here and a private one microseconds later (DNS rebinding)
+    is not caught. Closing that needs the socket pinned to the address that was
+    vetted, which urllib gives no hook for. Left as-is deliberately: the payoff
+    is one fetch of an attacker-named URL against a runner that holds only a
+    VirusTotal key, and the gain does not justify hand-rolling the HTTP client
+    this tool exists to avoid needing."""
     p = urlparse(url)
     if p.scheme != "https":
         raise ValidationError(f"refusing to fetch non-https URL {url!r}")
@@ -707,8 +720,16 @@ def inspect_zip_bundle(path):
         any_dll = root_dll = 0
         for info in infos:
             name = info.filename
-            if name.startswith(("/", "\\")) or (len(name) >= 2 and name[1] == ":"):
+            if name.startswith(("/", "\\")):
                 errs.append(f"unsafe zip entry {name!r}: absolute path")
+                continue
+            # A colon anywhere, not just a drive letter in position 1: on NTFS
+            # "mod.dll:payload" is an alternate data stream hanging off
+            # mod.dll, which a traversal check reads as an ordinary relative
+            # name. Same rule the launcher's extractor applies at install time.
+            if ":" in name:
+                errs.append(f"unsafe zip entry {name!r}: contains a colon "
+                            f"(drive letter or NTFS alternate data stream)")
                 continue
             norm = name.replace("\\", "/")
             if any(seg == ".." for seg in norm.split("/")):

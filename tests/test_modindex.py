@@ -96,6 +96,15 @@ class Structure(unittest.TestCase):
             {"name": "ExampleLib", "download_url": "https://example.com/downloads/ExampleLib.dll",
              "sha256": "b" * 64, "filename": "ExampleLib.dll"}])), [])
 
+    def test_library_filename_rejects_colons(self):
+        """Matches modmanager's _safe_basename and TavernLib's SafeBasename: a
+        colon is the drive separator, and on NTFS the alternate-data-stream
+        separator, so "ExampleLib.dll:payload" names a hidden stream."""
+        for bad in ("C:ExampleLib.dll", "ExampleLib.dll:payload"):
+            self.assertTrue(mi.validate_structure(manifest(library_dependencies=[
+                {"name": "ExampleLib", "download_url": "https://example.com/x.dll",
+                 "sha256": "b" * 64, "filename": bad}])), bad)
+
     def test_parse_id(self):
         self.assertEqual(mi.parse_id("User.Repo"), ("User", "Repo"))
         self.assertEqual(mi.parse_id("User.dotted.repo.name"), ("User", "dotted.repo.name"))
@@ -227,6 +236,15 @@ class InspectZipBundle(unittest.TestCase):
         self.assertTrue(mi.inspect_zip_bundle(self._zip([("/abs.dll", b"x")]))[0])
         self.assertTrue(mi.inspect_zip_bundle(
             self._zip([("link", b"/etc/passwd", 0o120777 << 16)]))[0])
+
+    def test_colon_entries_rejected(self):
+        """A drive-relative name, and an NTFS alternate data stream: on the
+        launcher's platform "Mod.dll:payload" writes a hidden stream hanging off
+        Mod.dll rather than a file. Neither contains a separator or a "..", so
+        the traversal checks above read both as ordinary relative names."""
+        for name in ("C:evil.dll", "Mod.dll:payload"):
+            errs, _ = mi.inspect_zip_bundle(self._zip([("Mod.dll", b"MZ"), (name, b"x")]))
+            self.assertTrue(any("colon" in e for e in errs), name)
 
     def test_too_many_entries_rejected(self):
         saved = mi.ZIP_MAX_ENTRIES
