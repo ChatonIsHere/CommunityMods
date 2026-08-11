@@ -256,9 +256,9 @@ def validate_structure(m):
     if "parity_required" not in m:
         # Mandatory rather than defaulted, so publishing a mod is a deliberate
         # answer to "must a joining client match this exactly?" rather than
-        # something inherited by omission. The readers still default it to true
-        # wherever it can legitimately be absent (an install record written
-        # before the field existed, an older server's handshake entry).
+        # something inherited by omission. No reader defaults it either: every
+        # shape it travels in is written by tooling that knows about it, so a
+        # missing one is malformed data and is rejected rather than guessed at.
         errs.append("parity_required is required: true if a client joining a "
                     "server that runs this mod must have this exact version, "
                     "false if the server should not block the join over it")
