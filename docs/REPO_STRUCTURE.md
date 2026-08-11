@@ -109,7 +109,7 @@ The launcher's parser enforces all of these.
 | `author`                      | Display author. Defaults to the text before the first dot in `id`.                                                                                                                                                                                                                                          |
 | `description`                 | Free text.                                                                                                                                                                                                                                                                                                  |
 | `client_side` / `server_side` | Booleans, at least one `true`. Controls which browse list the mod shows up in. The client launcher lists client-side mods, the server launcher lists server-side ones.                                                                                                                                      |
-| `parity_required`             | **Required.** Boolean: whether a client joining a server that runs this mod must match its exact version. `true` means the server refuses the join otherwise — for mods whose two halves are one system, like a voice codec or a network protocol, where a mismatch breaks the session outright. `false` means the server never blocks a join over it; the client is offered the mod, defaulted to installing, and can decline — for mods whose halves work independently, like a client performance tweak that happens to ship a server piece. Every manifest has to state it, so publishing is a deliberate answer rather than something inherited by omission. Only a real `false` relaxes it, so a malformed value reads as required; and where the field can legitimately be absent (an install record written before it existed, an older server's handshake entry) readers default it to `true` for the same reason. Only meaningful on a mod that is both `client_side` and `server_side`: a client-only mod is never in a server's list, and a server-only one is never asked of a client. |
+| `parity_required`             | **Required.** Boolean: whether a client joining a server that runs this mod must match its exact version. `true` means the server refuses the join otherwise — for mods whose two halves are one system, like a voice codec or a network protocol, where a mismatch breaks the session outright. `false` means the server never blocks a join over it; the client is offered the mod, defaulted to installing, and can decline — for mods whose halves work independently, like a client performance tweak that happens to ship a server piece. Every manifest has to state it, so publishing is a deliberate answer rather than something inherited by omission. Only a real `false` relaxes it, so a malformed value (a string, a `null`, a `0`) reads as required rather than being trusted. There is no default anywhere and nothing infers one: a manifest, index entry, install record, or handshake entry without the field is malformed, and readers reject it rather than guessing — guessing is the one mistake that matters here, because it decides whether a joining client is obliged to match. Only meaningful on a mod that is both `client_side` and `server_side`: a client-only mod is never in a server's list, and a server-only one is never asked of a client. |
 | `dependencies`                | `{}` or a map of other mod ids to a minimum version. Resolved by minimum-required-version with a major lock: candidates in the same major at or above the minimum, highest one wins. Always present, use `{}` for none.                                                                                     |
 | `library_dependencies`        | `[]` or a list of pinned third-party files (below). Always present, use `[]` for none.                                                                                                                                                                                                                      |
 | `package`                     | **Tooling-set, not submitter-written.** `"dll"` (`download_url` is the mod's single `.dll`) or `"zip"` (an archive extracted into the mod's folder, for a mod that ships several DLLs and/or Unity asset bundles / addressables). Determined by sniffing the file's own bytes during validation/ingest and baked into the compiled manifest (a zip starts with `PK`, anything else is a dll), so it can never disagree with the actual file. An unrecognised value in a compiled manifest skips it, same as an unknown `manifest_version`. |
@@ -155,3 +155,55 @@ A mod's record is named `manifest.json` on purpose: recent MelonLoader only scan
 **Disabling** a mod without uninstalling it renames its record from `manifest.json` to `manifest.disabled.json`. The folder and all its files stay, but with no `manifest.json` present MelonLoader stops scanning the folder, so the mod no longer loads; enabling renames it back. The folder itself is never renamed, so the mod stays addressable by `<id>` and keeps its place in the installed list.
 
 You never write these, they're an install artifact, documented here so the on-disk footprint is covered.
+
+## Untracked mods
+
+A record is what makes a mod *managed*. Anything else in `Mods/` that MelonLoader will still load is **untracked**, and both the launcher and a headless server report it as such rather than pretending it isn't there. Two shapes qualify:
+
+- a loose `Mods/<name>.dll` — the classic drag-a-dll-in manual install. Nothing that scans for mods looks at root files, only subfolders, so this is invisible to the installed list.
+- a `Mods/<name>/` folder carrying a `manifest.json` (or `manifest.disabled.json`) that this tooling didn't write.
+
+A folder counts on the record file **existing**, not on it parsing. MelonLoader's folder marker is an existence check with the content unread, so a folder whose `manifest.json` is unparseable junk loads exactly like one with a valid manifest, and hiding it would hide a mod that is genuinely running. A folder with neither file isn't reported, because MelonLoader wouldn't load it either. Folders prefixed `.` or `~` are skipped throughout — those are install staging directories.
+
+Untracked mods are **surfaced and toggled, never managed**. There's no manifest anyone trusts to resolve a version against, so they never appear anywhere near install, update, or uninstall:
+
+|                       | Managed                        | Untracked                                    |
+| --------------------- | ------------------------------ | -------------------------------------------- |
+| Install / update      | yes                            | no — nothing to resolve a version against     |
+| Enable / disable      | yes                            | yes                                           |
+| Uninstall             | yes                            | no — we didn't place the files, so we can't promise a clean removal |
+| In the join handshake | yes, enforced                  | yes, advisory only — never blocks a join      |
+| In an exported modlist | yes, in `mods`                | yes, in `untracked` — listed, never installed |
+
+**Enabling and disabling** works differently for the two shapes, because only one of them has a marker to hide:
+
+- a **folder** uses the same rename as a managed mod — `manifest.json` ⇄ `manifest.disabled.json`. The foreign manifest is never read or rewritten, only renamed.
+- a **loose dll** has no marker to rename, and MelonLoader loads any `Mods/*.dll` it finds, so the file itself moves: `Manual.dll` ⇄ `Manual.dll.disabled`. It's always referred to by its enabled name, so the same string toggles it either way. If both names are occupied at once the toggle is refused rather than resolved, since the rename would destroy one of the two files irrecoverably.
+
+Either way the files stay on disk, and the change takes effect the next time the game or server starts — MelonLoader has already scanned `Mods/` by the time anything can toggle one.
+
+The invariant that makes this safe: **nothing automatic ever enables or disables an untracked mod.** Not a headless server's reconcile pass, not a modlist import, not the per-server render a client does when joining. Only a person does, from the launcher's Mod Manager or the server console. A mod you hand-installed stays exactly as you left it.
+
+On a headless server, `modmanager list` shows them tagged alongside managed mods, and `modmanager enable` / `modmanager disable` act on them by name. Those two commands are deliberately restricted to untracked mods: a managed mod's state comes from the configured mods list, so disabling one by hand would be undone by the next reconcile — untracked mods are the ones reconcile never touches, which is exactly why toggling one sticks.
+
+### In the join handshake
+
+A server reports its enabled untracked mods to a connecting client, in the `mods_list` reply's `untracked` field — a separate list from `mods`, each entry just `{name, kind}`.
+
+It is **advisory and cannot block a join**. All a server can honestly say about one is its name and shape; there's no id, version, or source, so a client can display it but never resolve, install, or verify it. The server's parity check ignores untracked mods entirely, in both directions: it never requires one of a client, and it never inspects the client's own. What this replaces is the worse outcome — a mod affecting the session with no sign that it exists.
+
+Untracked mods are part of the ping/pong `mods_hash` even though they aren't part of `mods_count`. A client caches the whole reply against that hash, so leaving them out would let an operator drop a new DLL into `Mods/` and have every client keep reporting the old set. The per-mod stamp folded into the hash is the file or folder's mtime, not a content hash — this runs on every ping, and an in-place edit preserving mtime costing one stale advisory line is a fair trade for not hashing every DLL in `Mods/` on each one.
+
+`mods_count` stays managed-only: it's there so a client can sanity-check its cached `mods` list without decoding it, and that list is the managed one.
+
+### In an exported modlist
+
+An exported modlist records enabled untracked mods under a top-level `untracked` key, as `{name, kind}` entries — never as entries in `mods`. That separation is load-bearing rather than tidy: a launcher's exported modlist **is** a headless server's `/modlist` config, and everything in `mods` is parsed as `id` or `id@version`. A `"Manual.dll"` in there would be resolved against the trusted repos on every boot, failing each time, or worse matching an unrelated mod that happened to share the name. Kept in its own key, it's ignored by anything that didn't ask for it — including the headless config reader, which simply has no field for it.
+
+An importer **shows the block and installs nothing from it**, so a shared pack is honest about the part you'll have to reproduce by hand instead of silently under-describing the machine it came from. An `untracked` block never makes an import fail, and importing a modlist never disables the importer's own untracked mods — that's the same never-automatic invariant as everywhere else.
+
+### When an install needs an untracked folder's path
+
+Installing `SomeDev.SomeMod` when `Mods/SomeDev.SomeMod/` already exists and isn't ours does **not** delete it. The existing folder is moved to `Mods/.displaced/<name>/` (suffixed `.2`, `.3`, … if that path is taken too) and the install proceeds. Dot-prefixed, so nothing loads from there and neither lister reports it.
+
+Moving rather than deleting is what makes the collision safe to resolve automatically: a headless reconcile runs before the server is up, with no operator to prompt, and refusing the install instead would silently boot without a mod the server was configured to run. The launcher does the same on install and on restoring a cached version — the latter being the likelier of the two to meet one, since it runs on every join that switches a mod's version. Both log what moved and where. Cleaning out `.displaced/` is left to you.
