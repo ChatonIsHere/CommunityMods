@@ -32,7 +32,7 @@
     --foreground: #f0e6cc;
     --card: #241c17;
     --muted: #2e2218;
-    --muted-foreground: #8a7a62;
+    --muted-foreground: #d0c4aa;
     --border: #4a3828;
     --primary: #e8a840;
     --primary-dim: #8a5e1a;
@@ -61,7 +61,7 @@
   }
   .titles { flex: 1 1 20rem; min-width: 0; }
   h1 { font: 700 1.35rem/1.2 var(--serif); color: var(--primary); margin: 0 0 .15rem; }
-  .lede { color: var(--muted-foreground); margin: 0; font-size: .82rem; }
+  .lede { color: var(--foreground); margin: 0; font-size: .82rem; }
   .lede code { font: .78rem var(--mono); color: var(--accent); }
   .controls { display: flex; gap: .5rem; align-items: center; }
 
@@ -100,14 +100,14 @@
     display: grid; place-items: center;
     padding: .6rem; text-align: center;
     background: var(--muted); border-bottom: 1px solid var(--border);
-    font: 700 .85rem/1.25 var(--serif); color: var(--primary-dim);
+    font: 700 .85rem/1.25 var(--serif); color: var(--primary);
   }
   .shot img { width: 100%; height: 100%; object-fit: cover; }
   .card-body { padding: .55rem .65rem .65rem; display: flex; flex-direction: column; gap: .25rem; flex: 1; }
   .card-title { font: 700 .92rem/1.25 var(--serif); }
   .card-meta { font-size: .74rem; color: var(--muted-foreground); }
   .card-desc {
-    font-size: .78rem; color: var(--muted-foreground); flex: 1; margin: .1rem 0 .25rem;
+    font-size: .78rem; color: var(--foreground); flex: 1; margin: .1rem 0 .25rem;
     display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden;
   }
 
@@ -136,7 +136,7 @@
   td.name { font-weight: 600; }
   td.ver { color: var(--primary); font-family: var(--mono); }
   td.id { font: .74rem var(--mono); color: var(--muted-foreground); }
-  td.desc { color: var(--muted-foreground); }
+  td.desc { color: var(--foreground); }
   .dim { color: var(--muted-foreground); }
 
   /* badge */
