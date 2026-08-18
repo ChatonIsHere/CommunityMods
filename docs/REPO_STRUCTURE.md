@@ -108,6 +108,7 @@ The launcher's parser enforces all of these.
 | `version`                     | Exactly `MAJOR.MINOR.PATCH`, three plain integers. No pre-release or build suffix.                                                                                                                                                                                                                          |
 | `author`                      | Display author. Defaults to the text before the first dot in `id`.                                                                                                                                                                                                                                          |
 | `description`                 | Free text.                                                                                                                                                                                                                                                                                                  |
+| `screenshots`                 | Optional. A list of image URLs, shown on this repo's browsable page (up to four). Display only: no installer reads it, and it never affects what lands on disk. Publishing rules below.                                                                                                                     |
 | `client_side` / `server_side` | Booleans, at least one `true`. Controls which browse list the mod shows up in. The client launcher lists client-side mods, the server launcher lists server-side ones.                                                                                                                                      |
 | `parity_required`             | **Required.** Boolean: whether a client joining a server that runs this mod must match its exact version. `true` means the server refuses the join otherwise — for mods whose two halves are one system, like a voice codec or a network protocol, where a mismatch breaks the session outright. `false` means the server never blocks a join over it; the client is offered the mod, defaulted to installing, and can decline — for mods whose halves work independently, like a client performance tweak that happens to ship a server piece. Every manifest has to state it, so publishing is a deliberate answer rather than something inherited by omission. Only a real `false` relaxes it, so a malformed value (a string, a `null`, a `0`) reads as required rather than being trusted. There is no default anywhere and nothing infers one: a manifest, index entry, install record, or handshake entry without the field is malformed, and readers reject it rather than guessing — guessing is the one mistake that matters here, because it decides whether a joining client is obliged to match. Only meaningful on a mod that is both `client_side` and `server_side`: a client-only mod is never in a server's list, and a server-only one is never asked of a client. |
 | `dependencies`                | `{}` or a map of other mod ids to a minimum version. Resolved by minimum-required-version with a major lock: candidates in the same major at or above the minimum, highest one wins. Always present, use `{}` for none.                                                                                     |
@@ -115,6 +116,19 @@ The launcher's parser enforces all of these.
 | `package`                     | **Tooling-set, not submitter-written.** `"dll"` (`download_url` is the mod's single `.dll`) or `"zip"` (an archive extracted into the mod's folder, for a mod that ships several DLLs and/or Unity asset bundles / addressables). Determined by sniffing the file's own bytes during validation/ingest and baked into the compiled manifest (a zip starts with `PK`, anything else is a dll), so it can never disagree with the actual file. An unrecognised value in a compiled manifest skips it, same as an unknown `manifest_version`. |
 | `download_url`                | Direct `https://` URL to the mod's single `.dll` or its `.zip`. Submissions to this repo also require it to be a github.com release asset under the id's `owner/repo` (see SUBMITTING.md).                                                                              |
 | `sha256`                      | Lowercase hex SHA-256 of the file at `download_url`; the `.dll` or the `.zip` itself. The launcher downloads to a temp file, hashes it, and refuses to install on a mismatch. One hash per artifact; individual files inside a zip are not hashed separately.                                               |
+
+### screenshots
+
+Optional and display-only — the launcher never fetches one, so a mod with none is in no way second-class. They exist for the browsable page this repo publishes, which bakes them in at build time rather than loading them from wherever a manifest points at render time.
+
+A screenshot URL is only published if it is:
+
+- **https**, and hosted on `github.com` or `raw.githubusercontent.com`;
+- **under the mod's own `owner/repo`** — the same trust boundary `download_url` already has, so a manifest can't point the page at another author's repository or at an arbitrary host that would see every visitor's IP;
+- **at an immutable address** — a release asset, or a raw URL pinning a 40-character commit sha. A branch-relative raw URL is repointable after review, so approving one would bind nothing;
+- **a raster image**: `.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`. No `.svg` — script inside an SVG doesn't execute via `<img>`, but excluding the format removes the question instead of depending on how a page embeds it.
+
+Anything else is skipped, with the reason printed in the build log rather than silently dropped. Note what the extension rule does *not* claim: a `.png` URL can still serve something that isn't an image. That's tolerable because the page only ever puts it in an `<img>`, where a non-image simply fails to render — which is why the rules that matter are about *where it comes from*, not what it's called.
 
 ### dependencies vs library_dependencies
 
@@ -143,14 +157,16 @@ A mod folder that grows beyond one file needs no schema change: the same `Mods/<
 
 ## Sidecar files
 
-When the launcher installs something it writes a small record beside it, so it (and a future native installer) can tell what's present without re-reading any repo:
+When an installer puts something on disk it writes a small record beside it, so anything that reads that game folder later can tell what's present without re-reading any repo. Two installers write these — the launcher (Python) and TavernLib's native one on headless servers (C#) — and they write byte-for-byte the same shape, because either one may be reading the other's records:
 
 ```
-<game>/Mods/<id>/manifest.json         the fetched manifest verbatim + { source_repo, package, libraries }
+<game>/Mods/<id>/manifest.json         the fetched manifest verbatim + { source_repo, package, libraries, files }
 <game>/UserLibs/<filename>.meta.json   { filename, sha256, download_url }   for each installed library
 ```
 
 A mod's record is named `manifest.json` on purpose: recent MelonLoader only scans a `Mods/` subfolder that contains a file by that name (it checks existence only, never the content), so the record doubles as the marker that makes the folder load. The record does **not** store the placed DLL's filename, every operation works on the `Mods/<id>/` folder, so nothing needs to find the file by name. `libraries` is the list of library `filename`s that mod pins; the launcher uses it to reference-count `UserLibs/` on uninstall. A library is removed only when no remaining installed mod still lists it, so a shared library stays until its last user is gone. Uninstalling a mod deletes its whole `Mods/<id>/` folder.
+
+`files` is `{relative path: sha256}` for everything the install placed in that folder — hashed out of the staging directory just before the record is written, so the record is never a member of its own map. Keys always use forward slashes and hashes are lowercase hex, on every platform and in both implementations; that's what lets one installer's record be verified by the other. It's what turns "the version number says 1.2.0" into "these exact bytes are still here", so a mod half-eaten by antivirus or left truncated by a cut-short write reads as **damaged** instead of *Up to date*. A record without the key (written before it existed) simply has no damage detection — never "damaged", since there'd be no evidence either way. If you write your own installer, writing this map is optional; matching its shape if you do write it is not.
 
 **Disabling** a mod without uninstalling it renames its record from `manifest.json` to `manifest.disabled.json`. The folder and all its files stay, but with no `manifest.json` present MelonLoader stops scanning the folder, so the mod no longer loads; enabling renames it back. The folder itself is never renamed, so the mod stays addressable by `<id>` and keeps its place in the installed list.
 

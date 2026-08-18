@@ -1,0 +1,73 @@
+name: Publish page
+
+# Rebuilds the browsable mod page and deploys it to GitHub Pages.
+#
+# Separate from "Publish index", and downstream of it, on purpose: a merge has
+# to land in manifests/ and produce a rebuilt repository.json BEFORE anything
+# describes it. Chaining on workflow_run rather than sharing the trigger means
+# an index build that fails never publishes a page claiming the mod is there.
+#
+# Nothing is committed. The page is an artifact deployed straight to Pages, so
+# there's no generated file in the tree to review, no second bot commit per
+# merge, and no push against a protected branch to arrange.
+#
+# Pages must be set to "GitHub Actions" as its source (Settings -> Pages).
+
+on:
+  workflow_run:
+    workflows: ["Publish index"]
+    types: [completed]
+  # The page itself changing (template or generator) has to redeploy too, with
+  # no manifest involved.
+  push:
+    branches: [main]
+    paths:
+      - "tools/page.html"
+      - "tools/modindex.py"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only the newest page matters, so a queued run is superseded rather than
+# published in turn — unlike the index build, where each run is a real state
+# change that has to happen.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    # A failed index build must not publish a page describing an index it
+    # didn't write. (Manual and push runs have no upstream conclusion to check.)
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Explicitly main, not the triggering commit: a workflow_run starts
+          # from the commit that kicked off the INDEX build, which is one
+          # commit behind the rebuilt index that build then committed. Without
+          # this the page would always be one merge stale.
+          ref: main
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Bake the page
+        run: python tools/modindex.py site
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
