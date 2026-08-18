@@ -13,18 +13,16 @@ name: Publish page
 #
 # Pages must be set to "GitHub Actions" as its source (Settings -> Pages).
 
+# One automatic trigger, deliberately. This also ran on `push` to begin with,
+# which double-fired the moment a merge touched both tools/ and this file: two
+# runs raced for the same Pages environment and the concurrency rule cancelled
+# one mid-deployment, taking the other down with it ("Deployment cancelled").
+# Nothing is lost by dropping it -- "Publish index" already fires on tools/**,
+# so a change to the template or the generator chains through to here anyway.
 on:
   workflow_run:
     workflows: ["Publish index"]
     types: [completed]
-  # The page itself changing (template or generator) has to redeploy too, with
-  # no manifest involved.
-  push:
-    branches: [main]
-    paths:
-      - "tools/page.html"
-      - "tools/modindex.py"
-      - ".github/workflows/pages.yml"
   workflow_dispatch:
 
 permissions:
@@ -32,24 +30,26 @@ permissions:
   pages: write
   id-token: write
 
-# Only the newest page matters, so a queued run is superseded rather than
-# published in turn — unlike the index build, where each run is a real state
-# change that has to happen.
+# One deployment at a time, and never cancel one that's already running: a
+# half-finished Pages deployment doesn't just abandon its own run, it leaves
+# the environment in a cancelled state that fails the run replacing it. This
+# is GitHub's own guidance for Pages, and the opposite of what suits an
+# ordinary build.
 concurrency:
   group: pages
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   deploy:
     # A failed index build must not publish a page describing an index it
-    # didn't write. (Manual and push runs have no upstream conclusion to check.)
+    # didn't write. (A manual run has no upstream conclusion to check.)
     if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Explicitly main, not the triggering commit: a workflow_run starts
           # from the commit that kicked off the INDEX build, which is one
@@ -57,17 +57,17 @@ jobs:
           # this the page would always be one merge stale.
           ref: main
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
 
       - name: Bake the page
         run: python tools/modindex.py site
 
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: site
 
       - id: deploy
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
