@@ -33,18 +33,18 @@ jobs:
     steps:
       - name: Mint a token from the publish app (on the ruleset bypass list)
         id: app-token
-        uses: actions/create-github-app-token@v1
+        uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.PUBLISH_APP_ID }}
           private-key: ${{ secrets.PUBLISH_APP_PRIVATE_KEY }}
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Use the app token as the git credential so the commit and push
           # below are made by the app, bypassing branch protection.
           token: ${{ steps.app-token.outputs.token }}
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
 
