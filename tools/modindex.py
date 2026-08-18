@@ -28,8 +28,14 @@ Subcommands
                         manifests/<author>/<repo>/<version>.json; --prune then
                         deletes the moved submission files.
 
-Keep these rules in sync with the launcher's parser (TavernLauncher/modmanager.py)
-and docs/REPO_STRUCTURE.md.
+  site [--out DIR]      Bake the browsable page: tools/page.html with the mod
+                        list injected, written to site/index.html. Runs after
+                        build, in its own workflow, so the page only ever
+                        describes an index that compiled.
+
+Keep these rules in sync with the two parsers that read what this repo
+publishes -- the launcher's (TavernLauncher/tavern_shared/mods/manifest.py) and
+TavernLib's (Backend/Mods/ModDataModel.cs) -- and docs/REPO_STRUCTURE.md.
 """
 
 import argparse
@@ -64,8 +70,8 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 # cleanly against hand-written ones and against each other.
 _MANIFEST_ORDER = [
     "manifest_version", "id", "name", "version", "author", "description",
-    "client_side", "server_side", "parity_required", "dependencies",
-    "library_dependencies", "download_url", "sha256", "package",
+    "screenshots", "client_side", "server_side", "parity_required",
+    "dependencies", "library_dependencies", "download_url", "sha256", "package",
 ]
 _LIB_ORDER = ["name", "download_url", "sha256", "filename"]
 
@@ -1080,6 +1086,153 @@ def cmd_build(args):
     return 0
 
 
+# -- site command --------------------------------------------------------------
+
+# Where the generator injects the mod list. The empty array is part of the
+# marker and is replaced along with it, so the template stays a valid,
+# directly-openable page (chrome, empty list) rather than a broken half-file
+# only the generator can use - while the generated file gets `= [...]` and not
+# `= [...][]`, which is a syntax error.
+SITE_MARKER = "/*__MODS__*/[]"
+
+# Optional, display-only, and never part of an install. Raster formats only:
+# script inside an SVG doesn't execute via <img>, but it does the moment
+# anything renders it another way, and excluding the format removes the whole
+# question rather than depending on how the page happens to embed it today.
+SCREENSHOT_EXT_RE = re.compile(r"\.(?:png|jpe?g|webp|gif)$", re.IGNORECASE)
+SCREENSHOT_MAX = 4
+_COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _screenshot_ok(url, author, repo):
+    """None if url may be published on the page, else the reason it may not.
+
+    Four rules, and each one closes a specific hole rather than being general
+    tidiness:
+
+    - **On GitHub, under the mod's own owner/repo.** Same trust boundary the
+      mod's binary already has (see _url_owned_by, which enforces it for
+      download_url as a hard error). Without it a manifest could point the page
+      at any host on the internet, which is a tracker pointed at every visitor,
+      or at another author's repository.
+    - **An immutable address.** A release asset, or a raw URL pinning a
+      40-character commit sha. A branch-relative raw URL is repointable after
+      review, so approving one binds nothing: whatever a reviewer looked at
+      could be swapped for anything afterwards.
+    - **A raster extension.** See SCREENSHOT_EXT_RE.
+    - **https.** Everything else here already requires it.
+
+    Note what these rules do NOT claim: a URL ending in .png can still serve
+    something that isn't an image. That's tolerable precisely because the page
+    only ever puts it in an <img>, where a non-image simply fails to render -
+    so the check that matters is where it comes from, not what it's named.
+    """
+    if not isinstance(url, str) or not _is_https_url(url):
+        return "must be an https:// URL"
+    p = urlparse(url)
+    parts = [seg for seg in p.path.split("/") if seg]
+    if not SCREENSHOT_EXT_RE.search(p.path):
+        return "must end in .png, .jpg, .jpeg, .webp or .gif (an .svg can carry script)"
+    if len(parts) < 3 or parts[0].lower() != author.lower() or parts[1].lower() != repo.lower():
+        return f"must live under {author}/{repo}"
+
+    host = p.netloc.lower()
+    if host == "github.com":
+        if parts[2].lower() != "releases":
+            return "on github.com, only a release asset URL is accepted"
+        return None
+    if host == "raw.githubusercontent.com":
+        if not _COMMIT_SHA_RE.match(parts[2]):
+            return ("a raw URL must pin a 40-character commit sha rather than a "
+                    "branch name, which can be repointed after review")
+        return None
+    return "must be hosted on github.com or raw.githubusercontent.com"
+
+
+def _screenshots_for(m):
+    """The publishable screenshots off one manifest. Anything rejected is
+    skipped WITH a printed reason rather than dropped quietly: a screenshot
+    that silently never appears is indistinguishable from one the author
+    forgot to add."""
+    raw = m.get("screenshots")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        print(f"note  {m['id']}: screenshots must be a list of URLs, ignored")
+        return []
+    if len(raw) > SCREENSHOT_MAX:
+        print(f"note  {m['id']}: {len(raw)} screenshots listed, only the first "
+              f"{SCREENSHOT_MAX} are published")
+
+    author, repo = parse_id(m["id"])
+    out = []
+    for url in raw[:SCREENSHOT_MAX]:
+        why = _screenshot_ok(url, author, repo)
+        if why:
+            print(f"note  {m['id']}: not publishing screenshot {url!r} - {why}")
+            continue
+        out.append(url)
+    return out
+
+
+def cmd_site(args):
+    """Bake tools/page.html + the current mod list into site/index.html.
+
+    The page gets its data at build time rather than fetching repository.json
+    live: it can then never render a half-loaded or unreachable index, the
+    screenshot URLs in it have been through _screenshot_ok, and the collapse to
+    one row per mod happens here instead of in every visitor's browser.
+
+    Deliberately reads manifests/ rather than repository.json, because the page
+    needs a field (screenshots) that the index's slim per-major summary doesn't
+    carry -- and adding it there would put display data into the file every
+    launcher downloads on every browse."""
+    root = repo_root(args.repo)
+    template_path = os.path.join(root, "tools", "page.html")
+    if not os.path.isfile(template_path):
+        raise ValidationError(f"no page template at {template_path}")
+    with open(template_path, encoding="utf-8") as f:
+        template = f.read()
+    if SITE_MARKER not in template:
+        raise ValidationError(f"{template_path} has no {SITE_MARKER} to inject into")
+
+    mods = _collect_manifests(root)
+    rows = []
+    for mod_id in sorted(mods):
+        versions = mods[mod_id]
+        # The highest version overall is by definition in the highest major, so
+        # this is the same row the launcher's browse list shows.
+        latest = sorted(versions, key=_vkey)[-1]
+        m = versions[latest]
+        rows.append({
+            "id": mod_id,
+            "name": m.get("name", mod_id),
+            "author": m.get("author", mod_id.split(".", 1)[0]),
+            "description": m.get("description", ""),
+            "client_side": bool(m.get("client_side", False)),
+            "server_side": bool(m.get("server_side", False)),
+            "parity_required": parity_required(m),
+            "latest": latest,
+            "screenshots": _screenshots_for(m),
+        })
+    rows.sort(key=lambda r: r["name"].lower())
+
+    # Escaping '<' is what keeps a manifest string from closing the <script>
+    # element it's embedded in; < is valid inside a JSON string literal, so
+    # the data still parses as exactly what it was.
+    data = json.dumps(rows, ensure_ascii=False, indent=2).replace("<", "\\u003c")
+
+    out_dir = args.out or os.path.join(root, "site")
+    out_path = os.path.join(out_dir, "index.html")
+    os.makedirs(out_dir, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(template.replace(SITE_MARKER, data))
+
+    shots = sum(len(r["screenshots"]) for r in rows)
+    print(f"wrote {os.path.relpath(out_path, root)}: {len(rows)} mod(s), {shots} screenshot(s)")
+    return 0
+
+
 # -- entry point --------------------------------------------------------------
 
 def main(argv=None):
@@ -1104,6 +1257,10 @@ def main(argv=None):
     b.add_argument("--prune", action="store_true",
                    help="with --ingest, delete the moved submission files afterwards")
     b.set_defaults(func=cmd_build)
+
+    s = sub.add_parser("site", help="bake tools/page.html + the mod list into site/index.html")
+    s.add_argument("--out", help="output directory (default: site/)")
+    s.set_defaults(func=cmd_site)
 
     args = parser.parse_args(argv)
     try:
