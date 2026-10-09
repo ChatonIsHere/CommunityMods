@@ -1,0 +1,15 @@
+{
+  "manifest_version": 1,
+  "id": "Nyx12012.Tavern-Essentials",
+  "name": "Tavern Essentials",
+  "version": "0.12.2",
+  "author": "Nyx12012",
+  "description": "Cross-server friends, community server boards in the main menu, a postbox and more, for clients and servers.",
+  "client_side": true,
+  "server_side": true,
+  "parity_required": false,
+  "dependencies": {},
+  "library_dependencies": [],
+  "download_url": "https://github.com/Nyx12012/Tavern-Essentials/releases/download/v0.12.2/TavernEssentials-V1-0.12.2.zip",
+  "sha256": "a938b2fdeb9f3bb2ef7426e606a4689db6e3de096d327e1a752b69d1ef440321"
+}
