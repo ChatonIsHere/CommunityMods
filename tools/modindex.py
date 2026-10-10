@@ -28,8 +28,9 @@ Subcommands
                         manifests/<author>/<repo>/<version>.json; --prune then
                         deletes the moved submission files.
 
-Keep these rules in sync with the launcher's parser (TavernLauncher/modmanager.py)
-and docs/REPO_STRUCTURE.md.
+Keep these rules in sync with the launcher's parser (TavernLauncher's
+tavern_shared/mods/manifest.py), TavernLib's (Backend/Mods/ModDataModel.cs), and
+docs/REPO_STRUCTURE.md.
 """
 
 import argparse
@@ -64,7 +65,7 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 # cleanly against hand-written ones and against each other.
 _MANIFEST_ORDER = [
     "manifest_version", "id", "name", "version", "author", "description",
-    "client_side", "server_side", "parity_required", "dependencies",
+    "client_side", "server_side", "parity_required", "scenes", "dependencies",
     "library_dependencies", "download_url", "sha256", "package",
 ]
 _LIB_ORDER = ["name", "download_url", "sha256", "filename"]
@@ -84,6 +85,32 @@ def parity_required(m, default=True):
     all read as required, so neither an older manifest nor a malformed one from
     an unreviewed source can quietly drop a guarantee the server depends on."""
     return m.get("parity_required", default) is not False
+
+
+# The scenes a server can run, by the names a manifest's optional `scenes` lists.
+SCENES = ("normal", "quest", "tutorial")
+
+
+def scenes_error(m):
+    """What's wrong with a manifest's `scenes`, or None when it's fine. Absent
+    or null means every scene. Present, it must be a non-empty list of distinct
+    names from SCENES: the launcher and TavernLib keep names they don't know
+    (so a scene added later doesn't break older builds), which makes this the
+    one place a misspelt scene gets caught before it quietly matches nothing."""
+    value = m.get("scenes")
+    if value is None:
+        return None
+    if not isinstance(value, list) or not value:
+        return ("scenes must be a non-empty list of scenes the mod works in, out of "
+                + ", ".join(SCENES) + " (leave it out for a mod that works in all of them)")
+    bad = [s for s in value if not isinstance(s, str) or s not in SCENES]
+    if bad:
+        return (f"scenes lists {bad!r}, which isn't one of " + ", ".join(SCENES))
+    if len(set(value)) != len(value):
+        return "scenes lists the same scene more than once"
+    if set(value) == set(SCENES):
+        return "scenes lists every scene; leave it out instead, which means the same"
+    return None
 
 # A mod's download_url is a single assembly ("dll") or an archive extracted into
 # Mods/<id>/ ("zip"). Must match modmanager.ModManifest.package. Set by the
@@ -205,7 +232,7 @@ def summary_entry(highest_manifest, versions_in_major):
     No download_url/sha256/dependencies here; those live only in the per-version
     manifest, so the install-critical data has one home."""
     m = highest_manifest
-    return {
+    entry = {
         "name": m.get("name", m["id"]),
         "author": m.get("author", m["id"].split(".", 1)[0]),
         "description": m.get("description", ""),
@@ -214,8 +241,12 @@ def summary_entry(highest_manifest, versions_in_major):
         # Carried in the index too, so a launcher can tell a required mod from a
         # recommended one while browsing, without fetching every manifest.
         "parity_required": parity_required(m),
-        "versions": versions_in_major,
     }
+    # Same reason, only when the release names any: absent means every scene.
+    if m.get("scenes") is not None:
+        entry["scenes"] = list(m["scenes"])
+    entry["versions"] = versions_in_major
+    return entry
 
 
 def _write_json(path, obj):
@@ -277,6 +308,10 @@ def validate_structure(m):
             # Setting it false there reads like it does something.
             errs.append("parity_required false only means anything on a mod that "
                         "is both client_side and server_side")
+
+    scenes_problem = scenes_error(m)
+    if scenes_problem:
+        errs.append(scenes_problem)
 
     deps = m.get("dependencies", {})
     if not isinstance(deps, dict):
