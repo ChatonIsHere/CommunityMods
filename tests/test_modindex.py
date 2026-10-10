@@ -191,6 +191,35 @@ class Structure(unittest.TestCase):
         entry = mi.summary_entry(manifest(parity_required=False), ["1.0.0"])
         self.assertIs(entry["parity_required"], False)
 
+    # scenes: which of the normal/quest/tutorial scenes a mod works in.
+
+    def test_scenes_are_optional(self):
+        self.assertEqual(mi.validate_structure(manifest()), [])
+        self.assertEqual(mi.validate_structure(manifest(scenes=None)), [])
+
+    def test_a_subset_of_scenes_is_accepted(self):
+        for scenes in (["normal"], ["quest", "tutorial"], ["tutorial"]):
+            self.assertEqual(mi.validate_structure(manifest(scenes=scenes)), [], scenes)
+
+    def test_malformed_scenes_rejected(self):
+        """The launcher and TavernLib keep scene names they don't know, so a
+        typo would otherwise ship and quietly match no server at all."""
+        for bad in ([], "quest", ["Quest"], ["normal", "arena"], ["quest", "quest"], [1], {"quest": 1}):
+            errs = mi.validate_structure(manifest(scenes=bad))
+            self.assertTrue(any("scene" in e for e in errs), (bad, errs))
+
+    def test_listing_every_scene_is_rejected_in_favour_of_leaving_it_out(self):
+        errs = mi.validate_structure(manifest(scenes=["normal", "quest", "tutorial"]))
+        self.assertTrue(any("leave it out" in e for e in errs), errs)
+
+    def test_summary_carries_scenes_only_when_set(self):
+        self.assertEqual(mi.summary_entry(manifest(scenes=["quest"]), ["1.0.0"])["scenes"], ["quest"])
+        self.assertNotIn("scenes", mi.summary_entry(manifest(), ["1.0.0"]))
+
+    def test_scenes_keep_their_place_in_a_rewritten_manifest(self):
+        keys = list(mi.ordered_manifest(manifest(scenes=["quest"])).keys())
+        self.assertEqual(keys[keys.index("parity_required") + 1], "scenes")
+
 
 class InspectZipBundle(unittest.TestCase):
     """The package="zip" content checks, run on the downloaded archive."""
