@@ -24,7 +24,7 @@ You can add other sources under **Manage Sources** (inside Community Mods), but 
 
 ## For mod authors
 
-Want your mod in the default list? See [docs/SUBMITTING.md](docs/SUBMITTING.md) for the details. You publish your `.dll` and other necessary files in a GitHub release, write a manifest, and open a PR that drops it in `submissions/`. Automated checks validate the structure and hashes, then a maintainer reviews it before it merges. You never touch `repository.json` or the pointer files, those get generated on merge.
+Want your mod in the default list? See [docs/SUBMITTING.md](docs/SUBMITTING.md) for the details. You publish your mod's builds in a GitHub release (one `.dll` or `.zip` per build, each serving one or more of the `pc`, `server` and `quest` targets), write a manifest, and open a PR that drops it in `submissions/`. Automated checks validate the structure and hashes, then a maintainer reviews it before it merges. You never touch `repository.json` or the pointer files, those get generated on merge.
 
 ## For your own source
 
