@@ -1,6 +1,6 @@
 # Mod repository structure
 
-This is the file layout and JSON schema a repository has to serve to work as a TavernLauncher mod source. It applies to this repo and to any third-party source a user adds under **Manage Sources**.
+This is the file layout and JSON schema a repository has to serve to work as a TavernLauncher mod source. It applies to this repo and to any third-party source a user adds under **Manage Sources**. It also documents what the two installers (the launcher and TavernLib) put on disk and say to each other, because both have to agree on it exactly.
 
 There's no build server and no required GitHub Actions. A repository is just static JSON files at stable URLs. Generate them however you like, with a script, a CI job, or by hand. How this repo generates and checks them is a separate doc, [SUBMITTING.md](SUBMITTING.md).
 
@@ -25,24 +25,35 @@ Everything else is a fixed path under that base. The base URL is exactly what a 
 
 `repository.json` is the only file fetched during normal browsing, the whole catalogue in one request, so static hosting never needs a directory listing. It's a slim discovery index: enough to list mods and pick a version, but no install-critical data. The per-version files are the authoritative full record and are immutable, keep the old ones forever. The `latest` files are pointers, each a copy of one `<version>.json`, so a mod can be fetched by id with a plain GET and no API call.
 
-The launcher browses from `repository.json`, then fetches a mod's per-version manifest only when it actually installs, deriving the URL from the id and version (`manifests/<author>/<repo>/<version>.json`). So `download_url`, `sha256`, and the dependency lists live in exactly one place, the manifest, and can never drift from a copy in the index.
+The launcher browses from `repository.json`, then fetches a mod's per-version manifest only when it actually installs, deriving the URL from the id and version (`manifests/<author>/<repo>/<version>.json`). So download URLs, hashes, and the dependency lists live in exactly one place, the manifest, and can never drift from a copy in the index.
 
 Folder names come from the id, so they aren't free-form. See the id rule below.
+
+## Targets
+
+A **target** is a kind of process a mod's files are built for. There are three:
+
+| Target   | What runs it |
+| -------- | ------------ |
+| `pc`     | The game on a PC, as a player: SteamVR, a Meta headset over Link (the launcher's "Quest" platform option), or flycam. All of these are the same Windows build. |
+| `server` | A game server. Servers only ever run the PC build, launcher-run or headless. |
+| `quest`  | The standalone Quest headset (the Android build). Accepted and validated now so the format is ready, but nothing installs a `quest` file yet. |
+
+A target is a binary, not a game mode: which **scene** a server runs (normal, quest, tutorial) is a separate question, answered by `scenes`. A PC player joining a quest-scene server still gets the `pc` files.
 
 ## repository.json
 
 ```jsonc
 {
-  "index_version": 1,             // schema version of this index file
+  "index_version": 2,             // schema version of this index file
   "mods": {
     "<id>": {                     // e.g. "ExampleDev.ExampleMod"
       "<major>": {                // key is the major version as a string: "1", "2"
         "name": "Example Mod",
         "author": "ExampleDev",
         "description": "Does something useful.",
-        "client_side": true,
-        "server_side": true,
         "parity_required": true,      // see the manifest table
+        "targets": ["pc", "server"],  // every target the release has a file for, sorted
         "versions": ["1.0.0", "1.2.0"]   // every release in this major
       },
       ...
@@ -52,9 +63,9 @@ Folder names come from the id, so they aren't free-form. See the id rule below.
 }
 ```
 
-`index_version` is the schema version of this index file. It's separate from the `manifest_version` on the per-version manifests below: the index and the manifest are different schemas and version independently, so a launcher that doesn't recognise the index version skips the whole file rather than mis-reading it.
+`index_version` is the schema version of this index file. It's separate from the `manifest_version` on the per-version manifests below: the index and the manifest are different schemas and version independently, so a launcher that doesn't recognise the index version skips the whole file rather than mis-reading it. This build reads `2` only.
 
-Under `mods`, keyed by id, then by major version as a string. One entry per major. A mod with 1.4.0 and 2.1.0 out has both a `"1"` and a `"2"` entry, because a dependency locked to major 1 still has to resolve after major 2 ships. Each entry carries the discovery fields (`name`, `author`, `description`, `client_side`, `server_side`, `parity_required`, and `scenes` when that release names any, all taken from the highest release in that major) and `versions`, the list of every release in the major. The highest is `max(versions)`; that's the default install, and resolution picks the highest version at or above a dependency's minimum. The full manifest for any of those versions is one fetch away at `manifests/<author>/<repo>/<version>.json`.
+Under `mods`, keyed by id, then by major version as a string. One entry per major. A mod with 1.4.0 and 2.1.0 out has both a `"1"` and a `"2"` entry, because a dependency locked to major 1 still has to resolve after major 2 ships. Each entry carries the discovery fields (`name`, `author`, `description`, `parity_required`, `targets`, and `scenes` when that release names any, all taken from the highest release in that major) and `versions`, the list of every release in the major. `targets` is the sorted union of the targets of that release's artifacts. The highest version is `max(versions)`; that's the default install, and resolution picks the highest version at or above a dependency's minimum. The full manifest for any of those versions is one fetch away at `manifests/<author>/<repo>/<version>.json`.
 
 ## Manifest
 
@@ -62,7 +73,7 @@ This is the shape of the per-version files and the `latest*.json` pointers (not 
 
 ```jsonc
 {
-    "manifest_version": 1,
+    "manifest_version": 2,
 
     "id": "ExampleDev.ExampleMod",
     "name": "Example Mod",
@@ -70,53 +81,72 @@ This is the shape of the per-version files and the `latest*.json` pointers (not 
     "author": "ExampleDev",
     "description": "Does something useful.",
 
-    "client_side": true,
-    "server_side": true,
     "parity_required": true,
+    "scenes": ["normal", "quest"],    // optional
 
     "dependencies": {
         "SomeDev.UtilKit": "1.2.0",
     },
 
-    "library_dependencies": [
+    "artifacts": [
         {
-            "name": "ExampleLib",
-            "download_url": "https://github.com/SomeVendor/ExampleLib/releases/download/v2.0.0/ExampleLib.dll",
+            "targets": ["pc", "server"],
+            "download_url": "https://github.com/ExampleDev/ExampleMod/releases/download/v1.2.0/ExampleMod.dll",
             "sha256": "<64-char lowercase hex>",
-            "filename": "ExampleLib.dll",
+            "package": "dll",
+            "library_dependencies": [
+                {
+                    "name": "ExampleLib",
+                    "download_url": "https://github.com/SomeVendor/ExampleLib/releases/download/v2.0.0/ExampleLib.dll",
+                    "sha256": "<64-char lowercase hex>",
+                    "filename": "ExampleLib.dll",
+                },
+            ],
+        },
+        {
+            "targets": ["quest"],
+            "download_url": "https://github.com/ExampleDev/ExampleMod/releases/download/v1.2.0/ExampleMod-quest.zip",
+            "sha256": "<64-char lowercase hex>",
+            "package": "zip",
+            "library_dependencies": [],
         },
     ],
-
-    "download_url": "https://github.com/ExampleDev/ExampleMod/releases/download/v1.2.0/ExampleMod.dll",
-    "sha256": "<64-char lowercase hex>",
-
-    "package": "dll",
 }
 ```
 
-The `package` line above is shown because it appears in the compiled manifests, but **you don't write it**, the tooling determines `dll` vs `zip` from the file itself during validation/ingest and adds it. A submission omits it (see [`submissions/TEMPLATE.json`](../submissions/TEMPLATE.json)). There is no mod-level `filename`: a single-`.dll` mod is saved into `Mods/<id>/` under the name it was published with (falling back to `<id>.dll` only if that name isn't a usable `.dll`), and a zip bundle names its own files. Nothing ever looks the DLL up by name, so its exact name doesn't matter.
+Each `package` line above is shown because it appears in the compiled manifests, but **you don't write it**, the tooling determines `dll` vs `zip` from each file itself during validation/ingest and adds it. A submission omits it (see [`submissions/TEMPLATE.json`](../submissions/TEMPLATE.json)). There is no mod-level `filename`: a single-`.dll` artifact is saved under the name it was published with (falling back to `<id>.dll` only if that name isn't a usable `.dll`), and a zip names its own files. Nothing ever looks the DLL up by name, so its exact name doesn't matter.
+
+Compiled manifests are written with their keys in the order shown: `manifest_version`, `id`, `name`, `version`, `author`, `description`, `screenshots`, `parity_required`, `scenes`, `dependencies`, `artifacts`; inside an artifact `targets`, `download_url`, `sha256`, `package`, `library_dependencies`; inside a library `name`, `download_url`, `sha256`, `filename`.
 
 ### Field rules
 
-The launcher's parser enforces all of these.
+The launcher's parser and TavernLib's enforce all of these; this repo's validator enforces them and a few more, noted below.
 
-| Field                         | Rule                                                                                                                                                                                                                                                                                                        |
-| ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `manifest_version`            | Integer. This build supports major `1`. A manifest with a different major is skipped, not mis-parsed, so the schema can grow later without breaking older launchers.                                                                                                                                        |
-| `id`                          | `"<github-user>.<github-repo>"`, the mod's GitHub `owner/repo` with the `/` turned into a `.`. GitHub usernames can't contain a dot, so the text before the first dot is always the author. No path separators, no `.` or `..` segment.                                                                     |
-| `name`                        | Display name. Defaults to `id`.                                                                                                                                                                                                                                                                             |
-| `version`                     | Exactly `MAJOR.MINOR.PATCH`, three plain integers. No pre-release or build suffix.                                                                                                                                                                                                                          |
-| `author`                      | Display author. Defaults to the text before the first dot in `id`.                                                                                                                                                                                                                                          |
-| `description`                 | Free text.                                                                                                                                                                                                                                                                                                  |
-| `screenshots`                 | Optional. A list of image URLs, shown on this repo's browsable page (up to four). Display only: no installer reads it, and it never affects what lands on disk. Publishing rules below.                                                                                                                     |
-| `client_side` / `server_side` | Booleans, at least one `true`. Controls which browse list the mod shows up in. The client launcher lists client-side mods, the server launcher lists server-side ones.                                                                                                                                      |
-| `parity_required`             | **Required.** Boolean: whether a client joining a server that runs this mod must match its exact version. `true` means the server refuses the join otherwise — for mods whose two halves are one system, like a voice codec or a network protocol, where a mismatch breaks the session outright. `false` means the server never blocks a join over it; the client is offered the mod, defaulted to installing, and can decline — for mods whose halves work independently, like a client performance tweak that happens to ship a server piece. Every manifest has to state it, so publishing is a deliberate answer rather than something inherited by omission. The launcher and TavernLib refuse a missing or non-boolean value rather than guess: a manifest without it can't be installed, and an install record without it (written before the field existed) reads as untracked until the mod is reinstalled. Only meaningful on a mod that is both `client_side` and `server_side`: a client-only mod is never in a server's list, and a server-only one is never asked of a client. |
-| `scenes`                      | Optional. The scenes a server can run that the mod works in: a non-empty list of distinct names out of `"normal"`, `"quest"` and `"tutorial"`. Leave it out (or `null`) for a mod that works in all of them, which is what every mod without the field gets; listing all three is rejected for the same reason. A headless server skips a listed mod that doesn't work in the scene it's launched into (and disables an installed copy); the server launcher asks before installing one and warns at start; a joining client leaves out its own pinned mods that don't work in the server's scene. Mods a server runs are never second-guessed by its clients. Not part of the handshake fingerprint. The launcher and TavernLib keep names they don't know, so a scene added later doesn't break older builds; this repo's validator is what rejects a misspelt one. |
-| `dependencies`                | `{}` or a map of other mod ids to a minimum version. Resolved by minimum-required-version with a major lock: candidates in the same major at or above the minimum, highest one wins. Always present, use `{}` for none.                                                                                     |
-| `library_dependencies`        | `[]` or a list of pinned third-party files (below). Always present, use `[]` for none.                                                                                                                                                                                                                      |
-| `package`                     | **Tooling-set, not submitter-written.** `"dll"` (`download_url` is the mod's single `.dll`) or `"zip"` (an archive extracted into the mod's folder, for a mod that ships several DLLs and/or Unity asset bundles / addressables). Determined by sniffing the file's own bytes during validation/ingest and baked into the compiled manifest (a zip starts with `PK`, anything else is a dll), so it can never disagree with the actual file. An unrecognised value in a compiled manifest skips it, same as an unknown `manifest_version`. |
-| `download_url`                | Direct `https://` URL to the mod's single `.dll` or its `.zip`. Submissions to this repo also require it to be a github.com release asset under the id's `owner/repo` (see SUBMITTING.md).                                                                              |
-| `sha256`                      | Lowercase hex SHA-256 of the file at `download_url`; the `.dll` or the `.zip` itself. The launcher downloads to a temp file, hashes it, and refuses to install on a mismatch. One hash per artifact; individual files inside a zip are not hashed separately.                                               |
+| Field                         | Rule |
+| ----------------------------- | ---- |
+| `manifest_version`            | Integer. This build supports major `2`. A manifest with a different major is skipped, not mis-parsed, so the schema can grow later without breaking older launchers. |
+| `id`                          | `"<github-user>.<github-repo>"`, the mod's GitHub `owner/repo` with the `/` turned into a `.`. GitHub usernames can't contain a dot, so the text before the first dot is always the author. No path separators, no `.` or `..` segment. |
+| `name`                        | Display name. Defaults to `id`. |
+| `version`                     | Exactly `MAJOR.MINOR.PATCH`: three segments of ASCII digits, each at most 2147483647. No pre-release or build suffix. |
+| `author`                      | Display author. Defaults to the text before the first dot in `id`. |
+| `description`                 | Free text. |
+| `screenshots`                 | Optional. A list of image URLs, shown on this repo's browsable page (up to four). Display only: no installer reads it, and it never affects what lands on disk. Publishing rules below. |
+| `parity_required`             | **Required.** Boolean: whether a client joining a server that runs this mod must match its exact version. `true` means the server refuses the join otherwise — for mods whose two halves are one system, like a voice codec or a network protocol, where a mismatch breaks the session outright. `false` means the server never blocks a join over it; the client is offered the mod, defaulted to installing, and can decline — for mods whose halves work independently, like a client performance tweak that happens to ship a server piece. Every manifest has to state it, so publishing is a deliberate answer rather than something inherited by omission. The launcher and TavernLib refuse a missing or non-boolean value rather than guess. It only matters for a mod with a client target (`pc` or `quest`) that a server also runs; see "Joining a server". |
+| `scenes`                      | Optional. The scenes a server can run that the mod works in: a non-empty list of distinct names out of `"normal"`, `"quest"` and `"tutorial"`. Leave it out (or `null`) for a mod that works in all of them; listing all three is rejected for the same reason. A headless server skips a listed mod that doesn't work in the scene it's launched into (and disables an installed copy); the server launcher asks before installing one and warns at start; a joining client leaves out its own pinned mods that don't work in the server's scene. Mods a server runs are never second-guessed by its clients. Not part of the handshake fingerprint. The launcher and TavernLib keep names they don't know, so a scene added later doesn't break older builds; this repo's validator is what rejects a misspelt one. |
+| `dependencies`                | `{}` or a map of other mod ids to a minimum version. Resolved by minimum-required-version with a major lock: candidates in the same major at or above the minimum, highest one wins. Always present, use `{}` for none. Resolved per target; see below. |
+| `artifacts`                   | **Required.** A non-empty list of the files the mod ships, one entry per distinct build (below). |
+
+Inside each artifact:
+
+| Field                  | Rule |
+| ---------------------- | ---- |
+| `targets`              | A non-empty list of target names. A target may appear in only one artifact of a manifest; a manifest that lists one twice is refused. The launcher and TavernLib ignore names they don't know (so a target added later doesn't break them) and an artifact left with no known target; this repo's validator rejects unknown names. |
+| `download_url`         | Direct `https://` URL to this build's single `.dll` or its `.zip`. Submissions to this repo also require it to be a github.com release asset under the id's `owner/repo` (see SUBMITTING.md). |
+| `sha256`               | SHA-256 of the file at `download_url`, 64 hex characters (lowercase in compiled manifests; readers lowercase it). Anything else refuses the whole manifest. The installer downloads to a temp file, hashes it, and refuses to install on a mismatch. Files inside a zip are not hashed separately. |
+| `package`              | **Tooling-set, not submitter-written.** `"dll"` (the artifact is a single `.dll`) or `"zip"` (an archive extracted into the target folder, for a build that ships several DLLs and/or Unity asset bundles / addressables). Determined by sniffing the file's own bytes (a zip starts with `PK`, anything else is a dll), so it can never disagree with the actual file. An artifact with an unrecognised value is ignored, like an unknown target. |
+| `library_dependencies` | `[]` or a list of pinned third-party files this build links against (below). Always present. Per artifact because native libraries differ by platform. |
+
+A target that no artifact lists is a target the mod doesn't support. There is no other way to say where a mod runs.
 
 ### screenshots
 
@@ -136,42 +166,134 @@ Anything else is skipped, with the reason printed in the build log rather than s
 Two separate things:
 
 - `dependencies` are other mods, by id. They're manifests in some repo, each installs into its own `Mods/<id>/` folder, and they get full version-range resolution and conflict detection. Use this to depend on another community mod.
-- `library_dependencies` are pinned third-party files a mod links against, like an audio codec or other support library that isn't itself a mod. They install FLAT into `UserLibs/` at the exact file you pin (`filename` plus `sha256`), never bundled inside a mod's folder, with no version resolution and no ownership check. Its `download_url` must still be `https://`, it just isn't restricted to your own repo. You're pinning a specific external build you tested against.
+- `library_dependencies` are pinned third-party files a build links against, like an audio codec or other support library that isn't itself a mod. They install FLAT into `UserLibs/` at the exact file you pin (`filename` plus `sha256`), never bundled inside a mod's folder, with no version resolution and no ownership check. Its `download_url` must still be `https://`, it just isn't restricted to your own repo. You're pinning a specific external build you tested against.
 
-Two mods pinning the same `filename` with the same `sha256` install it once. The same `filename` with a different `sha256` is a conflict, and neither installs.
+Two installed builds pinning the same `filename` with the same `sha256` install it once. The same `filename` with a different `sha256` is a conflict, and the install that would cause it is refused. That holds across everything installed in one game folder, whichever target it was installed for, since `UserLibs/` is shared.
 
-**Dependencies are resolved per side.** When the launcher installs a mod's dependency closure it knows whether it's installing into a client or a server, and it leaves out any dependency that can't run there, along with anything only that dependency needed. So a mod that runs on **both** sides may depend on a **client-only** mod: the client gets it, the server doesn't, and neither has to be told about the other. This is the supported way to say "my client half needs this" — there is no per-side `dependencies` field, and none is needed.
+**Dependencies are resolved per target.** An installer always installs a closure *for* one target (`pc` from the client launcher, `server` from the server launcher and TavernLib), and it leaves out any dependency with no artifact for that target, along with anything only that dependency needed, saying so in its log. So a mod with `pc` and `server` builds may depend on a `pc`-only mod: players get it, servers don't. This is the supported way to say "my client half needs this" — there is no per-target `dependencies` field, and none is needed.
 
-What that costs you: the tooling can't tell whether your *server* half also touches that dependency, because no manifest states it and only your assembly knows. If it does, your server half won't load, and the dependency wouldn't have saved it (it can't run on a server either) — that's a mod bug, not a resolution one. A submission in this shape gets a note asking you to confirm, not a rejection.
+What that costs you: the tooling can't tell whether your *server* build also touches that dependency, because no manifest states it and only your assembly knows. A submission in this shape gets a note asking you to confirm, not a rejection.
 
-What **is** rejected: a dependency whose sides don't overlap with yours at all — a server-only mod depending on a client-only mod, or the reverse. That edge can never be satisfied in any process the mod runs in, so it's a dead relationship rather than a per-side one.
+What **is** rejected: a dependency that shares no target with your mod at all — a `server`-only mod depending on a `pc`-only mod, or the reverse. That edge can never be satisfied in any process the mod runs in.
 
-**What goes in the zip vs. a `library_dependency`:** put the mod's own code (even several managed DLLs) plus its Unity asset bundles / addressables in the `package:"zip"` archive. Put anything third-party or shared in `library_dependencies` so it's deduped and reference-counted in `UserLibs/` instead of duplicated in every mod that uses it. A **native/unmanaged DLL must be a `library_dependency`** regardless. MelonLoader only registers `UserLibs/` (not mod folders) as a native DLL search path, so a native DLL inside a mod folder won't be found.
+**What goes in the zip vs. a `library_dependency`:** put the build's own code (even several managed DLLs) plus its Unity asset bundles / addressables in the `package:"zip"` archive. Put anything third-party or shared in `library_dependencies` so it's deduped and reference-counted in `UserLibs/` instead of duplicated in every mod that uses it. A **native/unmanaged DLL must be a `library_dependency`** regardless. MelonLoader only registers `UserLibs/` (not mod folders) as a native DLL search path, so a native DLL inside a mod folder won't be found.
 
-**The zip must have at least one `.dll` at its root.** The archive root becomes `Mods/<id>/`, and MelonLoader loads the assemblies sitting directly in that folder (`Mods/<id>/*.dll`), it does **not** recurse into subfolders looking for a mod to load. So your mod's main assembly (and any managed DLL you want MelonLoader to load) must be at the top level of the zip, not tucked inside a subfolder; asset-bundle subfolders alongside them are fine. The submission validator rejects a bundle whose only `.dll`s are in subfolders, because it would install cleanly and then silently never load.
+**A zip must have at least one `.dll` at its root.** The archive root becomes the target folder, and the mod's main assembly belongs there. (MelonLoader does load DLLs in subfolders of a loaded folder too, but a zip whose only DLLs are tucked into subfolders is almost always a packaging mistake, so the validator rejects it.)
 
 ### Install destinations
 
-Destinations are structural, never manifest-supplied. Every mod installs into its own folder `Mods/<id>/`; libraries install flat into `UserLibs/`. For `package:"dll"` the launcher writes the single DLL into `Mods/<id>/` under the name it was published with (the `download_url`'s basename); for `package:"zip"` it extracts the archive into `Mods/<id>/`. Nothing ever looks the DLL up by name (every operation works on the folder), so its exact name doesn't matter, but two guards still apply: the name is run through the same bare-basename check as everything else (so a hostile `download_url` can't traverse out with a `..` or a separator), and it must end in `.dll` or MelonLoader won't load it, a name failing either check falls back to `<id>.dll`. Zip extraction is hardened against zip-slip the same way: any archive member with an absolute path, a drive letter, a `..` that escapes the folder, or a symlink is refused and nothing is installed. A `library_dependencies` file is the one thing whose name genuinely *matters* and *is* manifest-supplied (a bare `filename`, checked the same way), because libraries are resolved by exact name in `UserLibs/`.
+Destinations are structural, never manifest-supplied. Every mod gets its own folder `Mods/<id>/`, and each target's build installs into a dot-prefixed subfolder of it:
 
-A mod folder that grows beyond one file needs no schema change: the same `Mods/<id>/` holds the DLL(s) and any bundled assets, and the mod loads its own asset bundles / addressables relative to its DLL's own folder.
+```
+<game>/Mods/<id>/manifest.json      the install record (below)
+<game>/Mods/<id>/.pc/               the pc build, if installed here
+<game>/Mods/<id>/.server/           the server build, if installed here
+<game>/UserLibs/<filename>          libraries, flat
+```
+
+The client launcher installs only `pc` builds and the server launcher and TavernLib only `server` builds. One game folder often serves both (a host plays from the same install their server runs from), so a mod can have both subfolders at once, each untouched by the other side's installs. Nothing is ever placed directly in `Mods/<id>/` besides the record.
+
+For `package:"dll"` the single DLL is written into the target folder under the name it was published with (the `download_url`'s basename); for `package:"zip"` the archive is extracted into it. That name is run through the same bare-basename check as everything else (so a hostile `download_url` can't traverse out with a `..` or a separator), and it must end in `.dll`; a name failing either check falls back to `<id>.dll`. Zip extraction is hardened against zip-slip: any member with an absolute path, a colon (drive letter or NTFS stream), a `..` that escapes the folder, or a symlink is refused and nothing is installed. A member that resolves to the record's own name (`manifest.json` or `manifest.disabled.json` at the archive root, compared case-insensitively after resolving `.` and `..`) is skipped. A `library_dependencies` file is the one thing whose name genuinely *matters* and *is* manifest-supplied (a bare `filename`, checked the same way), because libraries are resolved by exact name in `UserLibs/`.
+
+### Which build loads
+
+MelonLoader 0.7 loads a `Mods/<name>/` folder that contains a `manifest.json` (an existence check; the content is never read) **and every subfolder beneath it**, except subfolders whose names start with `.` or `~` (and a few reserved names). So by default it loads neither `.pc/` nor `.server/`.
+
+TavernLib, which loads as a plugin before any mod, adds the right one back for the process it's running in: `.server/` in a server process (one started with the game's server argument, `/start_server`, which is also what puts TavernLib in server mode), `.pc/` in any other. It adds that folder and its own non-excluded subfolders to MelonLoader's mod folder list and assembly search path, for every mod whose record is enabled (`manifest.json`, not `manifest.disabled.json`), is ours (see "Sidecar files"), and lists that target under `installed`. It never adds anything for a mod that fails any of those.
+
+The consequence is deliberate: without TavernLib, or if it can't reach MelonLoader's folder list, a managed mod simply doesn't load. It can never load two builds into one process.
 
 ## Sidecar files
 
-When an installer puts something on disk it writes a small record beside it, so anything that reads that game folder later can tell what's present without re-reading any repo. Two installers write these — the launcher (Python) and TavernLib's native one on headless servers (C#) — and they write byte-for-byte the same shape, because either one may be reading the other's records:
+When an installer puts something on disk it writes a small record beside it, so anything that reads that game folder later can tell what's present without re-reading any repo. Two installers write these — the launcher (Python) and TavernLib's native one on headless servers (C#) — and they write byte-for-byte the same bytes for the same state, because either one may be reading the other's records:
 
 ```
-<game>/Mods/<id>/manifest.json         the fetched manifest verbatim + { source_repo, package, libraries, files }
+<game>/Mods/<id>/manifest.json         the install record
 <game>/UserLibs/<filename>.meta.json   { filename, sha256, download_url }   for each installed library
 ```
 
-A mod's record is named `manifest.json` on purpose: recent MelonLoader only scans a `Mods/` subfolder that contains a file by that name (it checks existence only, never the content), so the record doubles as the marker that makes the folder load. The record does **not** store the placed DLL's filename, every operation works on the `Mods/<id>/` folder, so nothing needs to find the file by name. `libraries` is the list of library `filename`s that mod pins; the launcher uses it to reference-count `UserLibs/` on uninstall. A library is removed only when no remaining installed mod still lists it, so a shared library stays until its last user is gone. Uninstalling a mod deletes its whole `Mods/<id>/` folder.
+A mod's record is named `manifest.json` on purpose: it's the marker MelonLoader checks before loading the folder at all.
 
-`files` is `{relative path: sha256}` for everything the install placed in that folder — hashed out of the staging directory just before the record is written, so the record is never a member of its own map. Keys always use forward slashes and hashes are lowercase hex, on every platform and in both implementations; that's what lets one installer's record be verified by the other. It's what turns "the version number says 1.2.0" into "these exact bytes are still here", so a mod half-eaten by antivirus or left truncated by a cut-short write reads as **damaged** instead of *Up to date*. A record without the key (written before it existed) simply has no damage detection — never "damaged", since there'd be no evidence either way. If you write your own installer, writing this map is optional; matching its shape if you do write it is not.
+### The install record
 
-**Disabling** a mod without uninstalling it renames its record from `manifest.json` to `manifest.disabled.json`. The folder and all its files stay, but with no `manifest.json` present MelonLoader stops scanning the folder, so the mod no longer loads; enabling renames it back. The folder itself is never renamed, so the mod stays addressable by `<id>` and keeps its place in the installed list.
+```jsonc
+{
+  "manifest_version": 2,
+  "id": "ExampleDev.ExampleMod",
+  "name": "Example Mod",
+  "version": "1.2.0",
+  "author": "ExampleDev",
+  "description": "Does something useful.",
+  "parity_required": true,
+  "scenes": ["normal", "quest"],        // only when the manifest sets it
+  "dependencies": { "SomeDev.UtilKit": "1.2.0" },
+  "artifacts": [ ... ],                 // the manifest's artifacts, verbatim, in manifest order
+  "source_repo": "https://raw.githubusercontent.com/.../main",
+  "installed": {
+    "pc": {
+      "sha256": "<the installed artifact's sha256>",
+      "libraries": ["ExampleLib.dll"],
+      "files": { "ExampleMod.dll": "<sha256>" }
+    },
+    "server": { ... }
+  }
+}
+```
+
+Exact rules, which both installers follow:
+
+- **Keys in exactly this order.** `scenes` only when set. Every artifact and library keeps the compiled-manifest key order above, and `screenshots` is never copied into a record.
+- **`installed`** has one entry per target installed in this folder, keys sorted. Each holds the installed artifact's `sha256`; `libraries`, the library `filename`s that build pins, in manifest order (used to reference-count `UserLibs/`); and `files`, `{path: sha256}` for every file placed in the target folder, paths relative to it with forward slashes, hashes lowercase hex, **keys sorted by ordinal (code-unit) order**.
+- **JSON formatting:** two-space indentation, `": "` between key and value, non-ASCII characters escaped as lowercase `\uXXXX`, CRLF line endings, no trailing newline.
+- **One version per record.** Installing target T at the record's version replaces only `.T/` and `installed.T`. Installing T at any other version (or into a folder whose record has no `installed`) replaces the whole mod: the other targets' entries are dropped and their folders removed, best effort; a folder that can't be removed because a running game has it open is left behind, and since it's no longer under `installed`, nothing loads it. The record is always written last, after the target folder is in place.
+- **"Is this folder ours"** is one predicate in both installers. The first of `manifest.json` and `manifest.disabled.json` that is strict UTF-8 (no BOM) holding a JSON object with a non-empty string `id` is the record, and it's ours only if its `parity_required` is a JSON boolean. A folder that fails is untracked (below), never deleted.
+- **Damage detection:** a target whose `files` don't all match on disk is **damaged**. An installer repairs a damaged target the next time it would otherwise call it current.
+
+`files` is what turns "the version number says 1.2.0" into "these exact bytes are still here", so a build half-eaten by antivirus or left truncated by a cut-short write reads as **damaged** instead of *Up to date*.
+
+**Disabling** a mod without uninstalling it renames its record from `manifest.json` to `manifest.disabled.json`. The folders and their files stay, but MelonLoader stops scanning the folder, so no target loads; enabling renames it back. It's one switch for the whole mod, shared by every target installed in the folder. **Uninstalling** deletes the whole `Mods/<id>/` folder; libraries are removed only when no remaining record's `installed` still lists them.
 
 You never write these, they're an install artifact, documented here so the on-disk footprint is covered.
+
+## Joining a server
+
+### What a server advertises
+
+A server's auth port answers `ping` with `mods_hash` and `mods_count`, and a `mods_list` request with the mods it is running and its untracked mods. A mod counts as running on a server only if its record is enabled, ours, and lists `server` under `installed`; a mod installed only for `pc` in the same folder is invisible to the server. Each `mods` entry is:
+
+```jsonc
+{
+  "id": "ExampleDev.ExampleMod",
+  "version": "1.2.0",
+  "parity_required": true,
+  "source_repo": "https://raw.githubusercontent.com/.../main",   // a hint only, never a pull source
+  "targets": ["pc", "server"],                                    // from the record's artifacts, sorted
+  "target_sha256": { "pc": "<sha>", "server": "<sha>" },          // per target, from the record's artifacts
+  "scenes": ["normal"]                                            // only when set
+}
+```
+
+`mods_hash` is unchanged: sha256 of the newline-joined lines `id@version@req|opt` for those mods, sorted by id, then `untracked:<name>@<mtime>` lines, sorted by lowercased name. Neither `targets` nor any hash is part of it.
+
+### What a joining PC client gets
+
+A client always installs the artifact for **its own** target, `pc`, whatever the server runs or which scene it's in. Of the server's entries, it considers only those whose `targets` include `pc`:
+
+- `parity_required: true` → required: installed at that exact version, or the launch is refused.
+- `parity_required: false` → offered, ticked by default; the player can decline.
+
+Entries without `pc` (a server-only mod, or one built only for `quest`) are left alone. The launcher compares its installed `pc` build's sha256 with the server's `target_sha256.pc` and notes a mismatch (same version, different build) without blocking.
+
+The game is launched with a `TavernMods` claim listing every enabled mod installed for `pc`, as `{id: version}`.
+
+### What the server enforces
+
+At join, TavernLib checks the claim against the mods it runs:
+
+- **A join carrying a claim** must hold the exact version of every mod with `parity_required: true` whose `targets` include `pc`.
+- **A join with no claim, or an unreadable one** (the standalone Quest app, TavernEssentials' in-game board, a direct connect) is refused if the server runs any mod with `parity_required: true` whose `targets` include `pc` or `quest`, and admitted otherwise.
+
+Version parity guards against honest mistakes, not cheating: the claim is self-reported.
 
 ## Untracked mods
 
@@ -199,9 +321,7 @@ Untracked mods are **surfaced and toggled, never managed**. There's no manifest 
 
 Either way the files stay on disk, and the change takes effect the next time the game or server starts — MelonLoader has already scanned `Mods/` by the time anything can toggle one.
 
-The invariant that makes this safe: **nothing automatic ever enables or disables an untracked mod.** Not a headless server's reconcile pass, not a modlist import, not the per-server render a client does when joining. Only a person does, from the launcher's Mod Manager or the server console. A mod you hand-installed stays exactly as you left it.
-
-On a headless server, `modmanager list` shows them tagged alongside managed mods, and `modmanager enable` / `modmanager disable` act on them by name. Those two commands are deliberately restricted to untracked mods: a managed mod's state comes from the configured mods list, so disabling one by hand would be undone by the next reconcile — untracked mods are the ones reconcile never touches, which is exactly why toggling one sticks.
+The invariant that makes this safe: **nothing automatic ever enables or disables an untracked mod.** Not a headless server's reconcile pass, not a modlist import, not the per-server render a client does when joining. Only a person does: from the launcher's Mod Manager, or on a headless server by renaming the file or record by hand (`modmanager list` shows them, tagged). The one exception is a loose `Mods/<name>.dll` with the same filename as a DLL an install just placed: it's disabled by the same rename, because MelonLoader would otherwise load the mod twice.
 
 ### In the join handshake
 
