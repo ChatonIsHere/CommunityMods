@@ -1,46 +1,89 @@
 """
 Tests for tools/modindex.py, the repository's validation rules and index
 compiler. Pure and offline: structural validation and the build/compile path
-touch no network (only `validate`'s hash/VirusTotal steps do, and those are not
-exercised here). Run from the repo root:  python -m unittest -v  or
+touch no network, and the download/VirusTotal steps are exercised only with
+the network stubbed out. Run from the repo root:  python -m unittest -v  or
 python tests/test_modindex.py
 """
 
 import argparse
+import contextlib
+import copy
+import glob
 import hashlib
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
 import urllib.error
 import zipfile
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(HERE), "tools"))
 import modindex as mi
 
+FIXTURES = os.path.join(HERE, "fixtures", "v2")
 
-def manifest(mod_id="Owner.Repo", version="1.0.0", **over):
+
+def artifact(owner="Owner", repo="Repo", version="1.0.0", targets=("pc", "server"),
+             asset=None, **over):
+    """One entry of `artifacts`, a release asset under owner/repo by default."""
+    a = {
+        "targets": list(targets),
+        "download_url": (f"https://github.com/{owner}/{repo}/releases/download/"
+                         f"v{version}/{asset or repo + '.dll'}"),
+        "sha256": "a" * 64,
+        "library_dependencies": [],
+    }
+    a.update(over)
+    return a
+
+
+def library(name="ExampleLib", sha="b" * 64, **over):
+    lib = {"name": name, "download_url": f"https://example.com/downloads/{name}.dll",
+           "sha256": sha, "filename": f"{name}.dll"}
+    lib.update(over)
+    return lib
+
+
+def manifest(mod_id="Owner.Repo", version="1.0.0", targets=("pc", "server"),
+             artifacts=None, **over):
+    """A valid v2 manifest. `targets` shapes the single default artifact;
+    `artifacts` replaces the list outright."""
     # tolerate a deliberately malformed id (no dot) so tests can build one
     author, repo = (mod_id.split(".", 1) + ["Repo"])[:2]
     d = {
-        "manifest_version": 1,
+        "manifest_version": 2,
         "id": mod_id,
         "name": repo,
         "version": version,
         "author": author,
         "description": "",
-        "client_side": True,
-        "server_side": True,
         "parity_required": True,
         "dependencies": {},
-        "library_dependencies": [],
-        "download_url": f"https://github.com/{author}/{repo}/releases/download/v{version}/{repo}.dll",
-        "sha256": "a" * 64,
+        "artifacts": (artifacts if artifacts is not None
+                      else [artifact(author, repo, version, targets)]),
     }
     d.update(over)
     return d
+
+
+def with_artifact(m, i=0, **over):
+    """m with artifacts[i] updated (keys set to None are removed)."""
+    m = copy.deepcopy(m)
+    for k, v in over.items():
+        if v is None:
+            m["artifacts"][i].pop(k, None)
+        else:
+            m["artifacts"][i][k] = v
+    return m
+
+
+def errors_about(errs, *needles):
+    return [e for e in errs if all(n in e for n in needles)]
 
 
 class Structure(unittest.TestCase):
@@ -49,20 +92,25 @@ class Structure(unittest.TestCase):
 
     def test_rules_reject(self):
         cases = {
-            "manifest_version": manifest(manifest_version=2),
+            "future manifest_version": manifest(manifest_version=3),
+            "boolean manifest_version": manifest(manifest_version=True),
             "bad id": manifest("noseparator"),
             "bad version": manifest(version="1.0"),
-            "no sides": manifest(client_side=False, server_side=False),
-            "short sha": manifest(sha256="abc"),
-            "uppercase sha": manifest(sha256="A" * 64),
-            "bad lib": manifest(library_dependencies=[
-                {"name": "x", "download_url": "https://x/y.dll",
-                 "sha256": "a" * 64, "filename": "sub/y.dll"}]),
-            "non-https mod": manifest(
-                download_url="http://github.com/Owner/Repo/releases/download/v1/x.dll"),
-            "file url lib": manifest(library_dependencies=[
-                {"name": "x", "download_url": "file:///etc/passwd",
-                 "sha256": "a" * 64, "filename": "y.dll"}]),
+            "version segment over int32": manifest(version="1.2147483648.0"),
+            "short sha": with_artifact(manifest(), sha256="abc"),
+            "uppercase sha": with_artifact(manifest(), sha256="A" * 64),
+            "bad lib filename": with_artifact(manifest(), library_dependencies=[
+                library(filename="sub/y.dll")]),
+            "lib with no name": with_artifact(manifest(), library_dependencies=[
+                library(name="")]),
+            "non-https artifact": with_artifact(manifest(), download_url=(
+                "http://github.com/Owner/Repo/releases/download/v1/x.dll")),
+            "file url lib": with_artifact(manifest(), library_dependencies=[
+                library(download_url="file:///etc/passwd")]),
+            "no dependencies": {k: v for k, v in manifest().items() if k != "dependencies"},
+            "no library_dependencies": with_artifact(manifest(), library_dependencies=None),
+            "no download_url": with_artifact(manifest(), download_url=None),
+            "not an object": [manifest()],
         }
         for label, m in cases.items():
             with self.subTest(label):
@@ -72,9 +120,11 @@ class Structure(unittest.TestCase):
         # Submitters omit package (the tooling sniffs and sets it); absent is fine.
         self.assertEqual(mi.validate_structure(manifest()), [])
         # If present it must still be valid, and survives canonical re-ordering.
-        self.assertEqual(mi.validate_structure(manifest(package="zip")), [])
-        self.assertTrue(mi.validate_structure(manifest(package="rar")))
-        self.assertEqual(mi.ordered_manifest(manifest(package="zip"))["package"], "zip")
+        self.assertEqual(mi.validate_structure(with_artifact(manifest(), package="zip")), [])
+        errs = mi.validate_structure(with_artifact(manifest(), package="rar"))
+        self.assertTrue(errors_about(errs, "artifacts[0].package"), errs)
+        ordered = mi.ordered_manifest(with_artifact(manifest(), package="zip"))
+        self.assertEqual(ordered["artifacts"][0]["package"], "zip")
 
     def test_sniff_package(self):
         self.assertEqual(mi._sniff_package(b"PK\x03\x04rest"), "zip")
@@ -83,27 +133,17 @@ class Structure(unittest.TestCase):
 
     def test_mod_has_no_filename_field(self):
         # A mod-level filename is neither required nor rejected, it's simply not
-        # part of the schema anymore (the mod installs as <id>.dll).
+        # part of the schema (a dll artifact keeps its published name).
         self.assertEqual(mi.validate_structure(manifest()), [])
         self.assertNotIn("filename", mi.ordered_manifest(manifest()))
-
-    def test_ownership_enforced_for_mod_not_library(self):
-        # mod binary must be under the id's owner/repo
-        self.assertTrue(mi.validate_structure(
-            manifest(download_url="https://github.com/someoneelse/thing/releases/download/v1/x.dll")))
-        # a library may point anywhere (third-party, unowned), no ownership rule
-        self.assertEqual(mi.validate_structure(manifest(library_dependencies=[
-            {"name": "ExampleLib", "download_url": "https://example.com/downloads/ExampleLib.dll",
-             "sha256": "b" * 64, "filename": "ExampleLib.dll"}])), [])
 
     def test_library_filename_rejects_colons(self):
         """Matches modmanager's _safe_basename and TavernLib's SafeBasename: a
         colon is the drive separator, and on NTFS the alternate-data-stream
         separator, so "ExampleLib.dll:payload" names a hidden stream."""
         for bad in ("C:ExampleLib.dll", "ExampleLib.dll:payload"):
-            self.assertTrue(mi.validate_structure(manifest(library_dependencies=[
-                {"name": "ExampleLib", "download_url": "https://example.com/x.dll",
-                 "sha256": "b" * 64, "filename": bad}])), bad)
+            m = with_artifact(manifest(), library_dependencies=[library(filename=bad)])
+            self.assertTrue(mi.validate_structure(m), bad)
 
     def test_parse_id(self):
         self.assertEqual(mi.parse_id("User.Repo"), ("User", "Repo"))
@@ -129,6 +169,7 @@ class Structure(unittest.TestCase):
             "non-numeric version": manifest(dependencies={"Other.Kit": "banana"}),
             "prerelease version": manifest(dependencies={"Other.Kit": "1.2.0-rc1"}),
             "non-string version": manifest(dependencies={"Other.Kit": 1}),
+            "segment over int32": manifest(dependencies={"Other.Kit": "9999999999.0.0"}),
         }
         for label, m in cases.items():
             with self.subTest(label):
@@ -158,6 +199,14 @@ class Structure(unittest.TestCase):
             errs = mi.validate_structure(manifest(parity_required=bad))
             self.assertTrue(any("parity_required" in e for e in errs), (bad, errs))
 
+    def test_false_is_accepted_whatever_the_targets(self):
+        """v2 dropped v1's 'false needs both sides' rule: the spec only says
+        where the value matters, and a pc-only mod with false is valid (the
+        reference fixtures carry one)."""
+        for targets in (["pc"], ["server"], ["quest"], ["pc", "server"]):
+            self.assertEqual(mi.validate_structure(
+                manifest(targets=targets, parity_required=False)), [], targets)
+
     def test_reader_only_relaxes_on_a_real_false(self):
         """Fail closed: a missing key, a null, or a string all read as required,
         so nothing malformed can quietly drop a guarantee a server depends on."""
@@ -165,19 +214,6 @@ class Structure(unittest.TestCase):
         for bad in ("false", "", None, 0, "optional"):
             self.assertTrue(mi.parity_required({"parity_required": bad}), bad)
         self.assertFalse(mi.parity_required({"parity_required": False}))
-
-    def test_false_needs_both_sides(self):
-        """Nothing to relax on a one-sided mod: a client-only mod is never in a
-        server's list, a server-only one is never asked of a client."""
-        for over in ({"server_side": False}, {"client_side": False}):
-            errs = mi.validate_structure(manifest(parity_required=False, **over))
-            self.assertTrue(any("both client_side and server_side" in e for e in errs),
-                            (over, errs))
-
-    def test_true_is_fine_on_a_one_sided_mod(self):
-        # It's the default, so it can't be an error to say it out loud.
-        self.assertEqual(
-            mi.validate_structure(manifest(parity_required=True, server_side=False)), [])
 
     def test_summary_still_defaults_a_missing_value_to_required(self):
         """summary_entry runs on already-validated manifests, so this can't
@@ -221,8 +257,195 @@ class Structure(unittest.TestCase):
         self.assertEqual(keys[keys.index("parity_required") + 1], "scenes")
 
 
+class ManifestVersion(unittest.TestCase):
+    """v2 is the only schema this repo takes, and the move from v1 is spelled
+    out rather than left to a pile of field-level errors."""
+
+    def _v1(self):
+        return {
+            "manifest_version": 1, "id": "Owner.Repo", "name": "Repo",
+            "version": "1.0.0", "author": "Owner", "description": "",
+            "client_side": True, "server_side": False, "parity_required": True,
+            "dependencies": {}, "library_dependencies": [],
+            "download_url": "https://github.com/Owner/Repo/releases/download/v1.0.0/Repo.dll",
+            "sha256": "a" * 64,
+        }
+
+    def test_v1_manifest_gets_one_message_saying_what_changed(self):
+        errs = mi.validate_structure(self._v1())
+        self.assertEqual(len(errs), 1, errs)
+        for needle in ("manifest_version 2", "client_side", "artifacts", "targets",
+                       "TEMPLATE.json"):
+            self.assertIn(needle, errs[0])
+
+    def test_leftover_top_level_fields_point_at_artifacts(self):
+        old = {"client_side": True, "server_side": True,
+               "download_url": "https://github.com/Owner/Repo/releases/download/v1/x.dll",
+               "sha256": "a" * 64, "package": "dll", "library_dependencies": []}
+        for key, value in old.items():
+            with self.subTest(key):
+                errs = mi.validate_structure(manifest(**{key: value}))
+                self.assertEqual(len(errs), 1, errs)
+                self.assertIn(f"top-level {key}", errs[0])
+                self.assertIn("artifacts", errs[0])
+
+
+class Artifacts(unittest.TestCase):
+    """The per-build list that replaced client_side/server_side."""
+
+    def _split(self):
+        """Different pc and server builds, the shape a single artifact can't say."""
+        return manifest(artifacts=[
+            artifact(targets=["pc"], asset="Repo-pc.dll"),
+            artifact(targets=["server"], asset="Repo-server.zip"),
+        ])
+
+    def test_shapes_that_pass(self):
+        cases = {
+            "one build for pc and server": manifest(),
+            "split pc and server builds": self._split(),
+            "pc only": manifest(targets=["pc"]),
+            "server only": manifest(targets=["server"]),
+            "quest only": manifest(targets=["quest"]),
+            "all three across two builds": manifest(artifacts=[
+                artifact(targets=["pc", "server"]),
+                artifact(targets=["quest"], asset="Repo-quest.zip")]),
+        }
+        for label, m in cases.items():
+            with self.subTest(label):
+                self.assertEqual(mi.validate_structure(m), [])
+
+    def test_artifacts_must_be_a_non_empty_list(self):
+        for bad in ([], None, {}, "Repo.dll"):
+            with self.subTest(bad=bad):
+                m = manifest()
+                m["artifacts"] = bad
+                errs = mi.validate_structure(m)
+                self.assertTrue(errors_about(errs, "artifacts must be a non-empty list"), errs)
+        m = manifest()
+        del m["artifacts"]
+        self.assertTrue(errors_about(mi.validate_structure(m), "artifacts"))
+
+    def test_an_artifact_must_be_an_object(self):
+        errs = mi.validate_structure(manifest(artifacts=[artifact(), "Repo.dll"]))
+        self.assertTrue(errors_about(errs, "artifacts[1] must be an object"), errs)
+
+    def test_targets_must_be_a_non_empty_list(self):
+        for bad in ([], None, "pc"):          # None: the key left out
+            with self.subTest(bad=bad):
+                errs = mi.validate_structure(with_artifact(manifest(), targets=bad))
+                self.assertTrue(errors_about(errs, "artifacts[0].targets"), errs)
+
+    def test_unknown_target_rejected(self):
+        """Installers skip names they don't know, so a typo would ship a build
+        nothing ever installs. This is where it gets caught."""
+        for bad in ("android", "PC", "client", "", 1):
+            with self.subTest(bad=bad):
+                errs = mi.validate_structure(manifest(targets=["pc", bad]))
+                self.assertTrue(errors_about(errs, "isn't a known target"), errs)
+
+    def test_target_in_two_artifacts_rejected(self):
+        m = manifest(artifacts=[
+            artifact(targets=["pc", "server"]),
+            artifact(targets=["server"], asset="Repo-server.zip")])
+        errs = mi.validate_structure(m)
+        self.assertEqual(len(errs), 1, errs)
+        self.assertIn("artifacts[1].targets lists 'server'", errs[0])
+        self.assertIn("artifacts[0] already lists", errs[0])
+
+    def test_target_twice_in_one_artifact_rejected(self):
+        errs = mi.validate_structure(manifest(targets=["pc", "pc"]))
+        self.assertTrue(errors_about(errs, "it already lists"), errs)
+
+    def test_ownership_is_checked_per_artifact(self):
+        # The second build pointing at someone else's repo fails, and the error
+        # names that build rather than the mod as a whole.
+        m = with_artifact(self._split(), 1, download_url=(
+            "https://github.com/someoneelse/thing/releases/download/v1/x.zip"))
+        errs = mi.validate_structure(m)
+        self.assertEqual(len(errs), 1, errs)
+        self.assertIn("artifacts[1].download_url", errs[0])
+        self.assertIn("Owner/Repo", errs[0])
+        # not a release asset host at all
+        m = with_artifact(manifest(), download_url="https://example.com/Owner/Repo/x.dll")
+        self.assertTrue(errors_about(mi.validate_structure(m), "artifacts[0].download_url"))
+
+    def test_library_is_not_ownership_checked(self):
+        # a library may point anywhere https (third-party, unowned)
+        self.assertEqual(mi.validate_structure(with_artifact(
+            manifest(), library_dependencies=[library()])), [])
+
+    def test_sha_is_checked_per_artifact(self):
+        m = with_artifact(self._split(), 1, sha256="not-a-hash")
+        errs = mi.validate_structure(m)
+        self.assertEqual(len(errs), 1, errs)
+        self.assertIn("artifacts[1].sha256", errs[0])
+
+    def test_library_errors_name_their_artifact(self):
+        m = with_artifact(self._split(), 1,
+                          library_dependencies=[library(), library("Bad", sha="x")])
+        errs = mi.validate_structure(m)
+        self.assertEqual(errs, ["artifacts[1].library_dependencies[1].sha256 must be "
+                                "64 lowercase hex characters"])
+
+    def test_check_urls_false_keeps_every_shape_rule(self):
+        """Only where files live is set aside, not what the manifest says."""
+        local = "http://127.0.0.1:8765/files/Repo.dll"
+        m = with_artifact(manifest(), download_url=local,
+                          library_dependencies=[library(download_url=local)])
+        self.assertTrue(mi.validate_structure(m))
+        self.assertEqual(mi.validate_structure(m, check_urls=False), [])
+        for broken in (with_artifact(m, targets=["android"]), with_artifact(m, sha256="x"),
+                       manifest(artifacts=[])):
+            self.assertTrue(mi.validate_structure(broken, check_urls=False))
+
+    def test_manifest_targets_is_the_sorted_union(self):
+        m = manifest(artifacts=[artifact(targets=["server"]),
+                                artifact(targets=["quest", "pc"])])
+        self.assertEqual(mi.manifest_targets(m), ["pc", "quest", "server"])
+        self.assertEqual(mi.manifest_targets(manifest(targets=["server"])), ["server"])
+
+
+class CanonicalOrder(unittest.TestCase):
+    """Compiled manifests are written with keys in the spec's order, at every
+    level, whatever order the submission used."""
+
+    MANIFEST = ["manifest_version", "id", "name", "version", "author", "description",
+                "screenshots", "parity_required", "scenes", "dependencies", "artifacts"]
+    ARTIFACT = ["targets", "download_url", "sha256", "package", "library_dependencies"]
+    LIBRARY = ["name", "download_url", "sha256", "filename"]
+
+    def _scrambled(self):
+        m = manifest(scenes=["quest"], screenshots=[], artifacts=[
+            artifact(package="dll", library_dependencies=[library()])])
+        m = dict(reversed(list(m.items())))
+        a = m["artifacts"][0]
+        m["artifacts"][0] = dict(reversed(list(a.items())))
+        lib = m["artifacts"][0]["library_dependencies"][0]
+        m["artifacts"][0]["library_dependencies"][0] = dict(reversed(list(lib.items())))
+        return m
+
+    def test_every_level_is_reordered(self):
+        out = mi.ordered_manifest(self._scrambled())
+        self.assertEqual(list(out), self.MANIFEST)
+        self.assertEqual(list(out["artifacts"][0]), self.ARTIFACT)
+        self.assertEqual(list(out["artifacts"][0]["library_dependencies"][0]), self.LIBRARY)
+
+    def test_unknown_keys_are_kept_at_the_end(self):
+        m = manifest(extra=1)
+        m["artifacts"][0] = {"x_note": "hi", **m["artifacts"][0]}
+        out = mi.ordered_manifest(m)
+        self.assertEqual(list(out)[-1], "extra")
+        self.assertEqual(list(out["artifacts"][0])[-1], "x_note")
+
+    def test_summary_entry_order(self):
+        entry = mi.summary_entry(manifest(scenes=["quest"]), ["1.0.0"])
+        self.assertEqual(list(entry), ["name", "author", "description", "parity_required",
+                                       "targets", "scenes", "versions"])
+
+
 class InspectZipBundle(unittest.TestCase):
-    """The package="zip" content checks, run on the downloaded archive."""
+    """The package="zip" content checks, run on each downloaded archive."""
 
     def _zip(self, entries):
         """entries: (arcname, data) or (arcname, data, external_attr)."""
@@ -255,8 +478,8 @@ class InspectZipBundle(unittest.TestCase):
         self.assertTrue(any("no .dll" in e for e in errs))
 
     def test_dll_only_in_subfolder_is_error(self):
-        # MelonLoader loads Mods/<id>/*.dll and does not recurse, so a nested-only
-        # .dll would never load, hard fail, not a warning.
+        # MelonLoader would load it, but a zip whose only DLLs sit in subfolders
+        # is almost always a packaging mistake, so it's a hard fail.
         errs, _ = mi.inspect_zip_bundle(self._zip([("sub/Mod.dll", b"MZ")]))
         self.assertTrue(any("archive root" in e for e in errs))
 
@@ -293,17 +516,21 @@ class InspectZipBundle(unittest.TestCase):
         self.assertTrue(any("ratio" in e for e in errs))
 
 
+def _zip_bytes(entries):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, data in entries:
+            zf.writestr(name, data)
+    return buf.getvalue()
+
+
 class ZipMemberScanning(unittest.TestCase):
     """Only code-bearing members of a zip get VirusTotal-scanned, not the whole
     archive (a bulky mod is mostly inert assets)."""
 
     def _zip(self, entries):
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for name, data in entries:
-                zf.writestr(name, data)
         tmp = tempfile.NamedTemporaryFile(prefix="zm_", suffix=".zip", delete=False)
-        tmp.write(buf.getvalue()); tmp.close()
+        tmp.write(_zip_bytes(entries)); tmp.close()
         self.addCleanup(lambda p=tmp.name: os.path.exists(p) and os.remove(p))
         return tmp.name
 
@@ -356,6 +583,144 @@ class ZipMemberScanning(unittest.TestCase):
         mi._vt_scan_zip_members(z, "APIKEY", 0, "mod", errs, warns)
         self.assertEqual(seen, [])
         self.assertTrue(any("no executable members" in w for w in warns))
+
+
+class _Validate(unittest.TestCase):
+    """cmd_validate end to end, with the network stubbed: download_and_hash
+    serves bytes from self.files by URL, and vt_scan records what it's asked."""
+
+    CLEAN = {"malicious": 0, "suspicious": 0, "harmless": 1, "undetected": 60}
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="modindex_validate_")
+        self.addCleanup(lambda: shutil.rmtree(self.root, ignore_errors=True))
+        self.files = {}           # url -> bytes
+        self.scanned = []         # sha256 of every file handed to vt_scan
+        self.stats = dict(self.CLEAN)
+
+        def fake_download(url):
+            data = self.files[url]
+            fd, tmp = tempfile.mkstemp(prefix="modindex_test_")
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            return tmp, hashlib.sha256(data).hexdigest()
+
+        def fake_vt(path, sha, api_key):
+            self.scanned.append(sha)
+            return self.stats
+
+        for name, fake in (("download_and_hash", fake_download), ("vt_scan", fake_vt)):
+            saved = getattr(mi, name)
+            setattr(mi, name, fake)
+            self.addCleanup(lambda n=name, s=saved: setattr(mi, n, s))
+        saved_key = os.environ.get("VIRUSTOTAL_API_KEY")
+        os.environ["VIRUSTOTAL_API_KEY"] = "KEY"
+        self.addCleanup(lambda: os.environ.__setitem__("VIRUSTOTAL_API_KEY", saved_key)
+                        if saved_key is not None else os.environ.pop("VIRUSTOTAL_API_KEY", None))
+
+    def serve(self, url, data):
+        self.files[url] = data
+        return hashlib.sha256(data).hexdigest()
+
+    def run_validate(self, *manifests, vt_max_malicious=None):
+        paths = []
+        for m in manifests:
+            path = os.path.join(self.root, "submissions", m["id"], f'{m["version"]}.json')
+            mi._write_json(path, m)
+            paths.append(path)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = mi.cmd_validate(argparse.Namespace(
+                repo=self.root, paths=paths, vt_max_malicious=vt_max_malicious))
+        return rc, out.getvalue()
+
+
+class ValidatePerArtifact(_Validate):
+    def _split(self, pc_bytes, server_bytes):
+        pc = artifact(targets=["pc"], asset="Repo-pc.dll")
+        server = artifact(targets=["server"], asset="Repo-server.zip")
+        pc["sha256"] = self.serve(pc["download_url"], pc_bytes)
+        server["sha256"] = self.serve(server["download_url"], server_bytes)
+        return manifest(artifacts=[pc, server])
+
+    def test_every_artifact_is_downloaded_and_verified(self):
+        m = self._split(b"MZ pc", _zip_bytes([("Repo.dll", b"MZ server")]))
+        rc, out = self.run_validate(m)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("artifacts[1] (server): detected a zip bundle", out)
+
+    def test_sha_mismatch_names_the_artifact(self):
+        m = self._split(b"MZ pc", _zip_bytes([("Repo.dll", b"MZ server")]))
+        m["artifacts"][1]["sha256"] = "c" * 64
+        rc, out = self.run_validate(m)
+        self.assertEqual(rc, 1)
+        self.assertIn("FAIL  artifacts[1] (server): sha256 mismatch", out)
+
+    def test_zip_rules_apply_per_artifact(self):
+        m = self._split(b"MZ pc", _zip_bytes([("sub/Repo.dll", b"MZ server")]))
+        rc, out = self.run_validate(m)
+        self.assertEqual(rc, 1)
+        self.assertIn("FAIL  artifacts[1] (server): zip bundle has .dll files only in subfolders",
+                      out)
+
+    def test_v1_submission_fails_with_the_migration_message(self):
+        rc, out = self.run_validate(ManifestVersion()._v1())
+        self.assertEqual(rc, 1)
+        self.assertIn("manifest_version 1 is the old format", out)
+
+
+class VirusTotalDedupe(_Validate):
+    """Each distinct file is scanned once per run, by sha256, wherever it
+    appears: two artifacts, a library both builds pin, two manifests."""
+
+    def test_same_bytes_across_artifacts_and_libraries_scanned_once(self):
+        lib = b"MZ shared library"
+        same = b"MZ identical build"
+        pc = artifact(targets=["pc"], asset="Repo-pc.dll")
+        server = artifact(targets=["server"], asset="Repo-server.dll")
+        pc["sha256"] = self.serve(pc["download_url"], same)
+        server["sha256"] = self.serve(server["download_url"], same)
+        lib_sha = self.serve("https://example.com/downloads/ExampleLib.dll", lib)
+        pc["library_dependencies"] = [library(sha=lib_sha)]
+        server["library_dependencies"] = [library(sha=lib_sha)]
+        rc, out = self.run_validate(manifest(artifacts=[pc, server]))
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(sorted(self.scanned), sorted({hashlib.sha256(same).hexdigest(),
+                                                       hashlib.sha256(lib).hexdigest()}))
+        self.assertEqual(out.count("already scanned"), 2, out)
+
+    def test_zip_member_matching_a_library_is_scanned_once(self):
+        lib = b"MZ shared library"
+        art = artifact(targets=["pc", "server"], asset="Repo.zip")
+        art["sha256"] = self.serve(art["download_url"], _zip_bytes(
+            [("Repo.dll", b"MZ mod"), ("ExampleLib.dll", lib)]))
+        lib_sha = self.serve("https://example.com/downloads/ExampleLib.dll", lib)
+        art["library_dependencies"] = [library(sha=lib_sha)]
+        rc, out = self.run_validate(manifest(artifacts=[art]))
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(len(self.scanned), 2)          # Repo.dll + the library, once
+        self.assertEqual(len(set(self.scanned)), 2)
+
+    def test_a_flagged_file_fails_every_manifest_it_appears_in(self):
+        self.stats = {"malicious": 3, "suspicious": 0, "harmless": 0, "undetected": 60}
+        a = manifest("Owner.First")
+        b = manifest("Owner.Second")
+        for m in (a, b):
+            m["artifacts"][0]["sha256"] = self.serve(m["artifacts"][0]["download_url"],
+                                                     b"MZ same bytes")
+        rc, out = self.run_validate(a, b, vt_max_malicious=0)
+        self.assertEqual(rc, 1)
+        self.assertEqual(len(self.scanned), 1)          # scanned once ...
+        self.assertEqual(out.count("malicious=3 exceeds"), 2, out)   # ... gates both
+        self.assertIn("2 manifest(s) checked, 2 failed.", out)
+
+    def test_without_seen_every_call_scans(self):
+        # The helpers stay usable one-off (seen=None), as before.
+        tmp = tempfile.NamedTemporaryFile(delete=False); tmp.write(b"x"); tmp.close()
+        self.addCleanup(lambda: os.remove(tmp.name))
+        for _ in range(2):
+            mi._vt_scan_path(tmp.name, "d" * 64, "KEY", None, "f", [], [])
+        self.assertEqual(len(self.scanned), 2)
 
 
 class _FakeResp:
@@ -458,10 +823,11 @@ class FetchSafety(unittest.TestCase):
 class Build(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix="modindex_repo_")
-        self.addCleanup(lambda: __import__("shutil").rmtree(self.root, ignore_errors=True))
-        # Ingest sniffs the download to set `package`; stub that network read.
+        self.addCleanup(lambda: shutil.rmtree(self.root, ignore_errors=True))
+        # Ingest sniffs each artifact's download to set `package`; stub that
+        # network read (a .zip asset name sniffs as a zip).
         saved = mi._sniff_package_from_url
-        mi._sniff_package_from_url = lambda url: "dll"
+        mi._sniff_package_from_url = lambda url: "zip" if url.endswith(".zip") else "dll"
         self.addCleanup(lambda: setattr(mi, "_sniff_package_from_url", saved))
 
     def _submit(self, m):
@@ -470,7 +836,8 @@ class Build(unittest.TestCase):
 
     def _build(self, ingest=True, prune=True):
         args = argparse.Namespace(repo=self.root, ingest=ingest, prune=prune)
-        return mi.cmd_build(args)
+        with contextlib.redirect_stdout(io.StringIO()):
+            return mi.cmd_build(args)
 
     def _read(self, *parts):
         with open(os.path.join(self.root, *parts), encoding="utf-8") as f:
@@ -485,30 +852,58 @@ class Build(unittest.TestCase):
         self.assertEqual(self._read(base, "latest.1.json")["version"], "1.0.0")
         # repository.json entry is a slim summary: versions list, no metrics,
         # and none of the install-critical data (that lives in the manifest).
-        entry = self._read("repository.json")["mods"]["Owner.Repo"]["1"]
+        index = self._read("repository.json")
+        self.assertEqual(index["index_version"], 2)
+        entry = index["mods"]["Owner.Repo"]["1"]
         self.assertEqual(entry["versions"], ["1.0.0"])
         self.assertEqual(entry["name"], "Repo")
-        for absent in ("stars", "downloads", "download_url", "sha256",
-                       "dependencies", "library_dependencies", "version"):
+        self.assertEqual(entry["targets"], ["pc", "server"])
+        for absent in ("stars", "downloads", "download_url", "sha256", "artifacts",
+                       "dependencies", "library_dependencies", "version",
+                       "client_side", "server_side"):
             self.assertNotIn(absent, entry)
         # the per-version manifest still has the full data
         full = self._read(base, "1.0.0.json")
-        self.assertIn("download_url", full)
-        self.assertIn("sha256", full)
+        self.assertIn("download_url", full["artifacts"][0])
+        self.assertIn("sha256", full["artifacts"][0])
         # submission consumed
         self.assertFalse(os.path.exists(os.path.join(self.root, "submissions", "Owner.Repo")))
 
-    def test_ingest_sets_package_from_sniff(self):
-        # Submitter provides no package; ingest sniffs the file and writes it.
-        self._submit(manifest("Owner.Repo", "1.0.0"))          # no "package" key
+    def test_ingest_sets_package_per_artifact_from_sniff(self):
+        # Submitter provides no package; ingest sniffs each file and writes it.
+        self._submit(manifest("Owner.Repo", "1.0.0", artifacts=[
+            artifact(targets=["pc"], asset="Repo-pc.dll"),
+            artifact(targets=["server"], asset="Repo-server.zip")]))
         self._build()
-        self.assertEqual(self._read("manifests", "Owner", "Repo", "1.0.0.json")["package"], "dll")
+        arts = self._read("manifests", "Owner", "Repo", "1.0.0.json")["artifacts"]
+        self.assertEqual([a["package"] for a in arts], ["dll", "zip"])
 
-    def test_ingest_sets_package_zip_when_sniffed(self):
-        mi._sniff_package_from_url = lambda url: "zip"
-        self._submit(manifest("Owner.Repo", "1.0.0"))
+    def test_compiled_manifest_is_written_in_canonical_order(self):
+        m = manifest("Owner.Repo", "1.0.0", scenes=["quest"], artifacts=[
+            artifact(library_dependencies=[library()])])
+        m = dict(reversed(list(m.items())))
+        m["artifacts"][0] = dict(reversed(list(m["artifacts"][0].items())))
+        lib = m["artifacts"][0]["library_dependencies"][0]
+        m["artifacts"][0]["library_dependencies"][0] = dict(reversed(list(lib.items())))
+        self._submit(m)
         self._build()
-        self.assertEqual(self._read("manifests", "Owner", "Repo", "1.0.0.json")["package"], "zip")
+        for name in ("1.0.0.json", "latest.json", "latest.1.json"):
+            out = self._read("manifests", "Owner", "Repo", name)
+            self.assertEqual(list(out), [k for k in CanonicalOrder.MANIFEST if k in out], name)
+            self.assertEqual(list(out["artifacts"][0]), CanonicalOrder.ARTIFACT, name)
+            self.assertEqual(list(out["artifacts"][0]["library_dependencies"][0]),
+                             CanonicalOrder.LIBRARY, name)
+
+    def test_index_targets_come_from_the_highest_release_in_each_major(self):
+        self._submit(manifest("Owner.Repo", "1.0.0", targets=["pc"]))
+        self._submit(manifest("Owner.Repo", "1.1.0", artifacts=[
+            artifact(version="1.1.0", targets=["server"], asset="Repo-server.dll"),
+            artifact(version="1.1.0", targets=["pc"], asset="Repo-pc.dll")]))
+        self._submit(manifest("Owner.Repo", "2.0.0", targets=["quest"]))
+        self._build()
+        mods = self._read("repository.json")["mods"]["Owner.Repo"]
+        self.assertEqual(mods["1"]["targets"], ["pc", "server"])     # sorted union, 1.1.0
+        self.assertEqual(mods["2"]["targets"], ["quest"])
 
     def test_highest_per_major(self):
         for v in ("1.0.0", "1.2.0", "2.0.0"):
@@ -537,12 +932,26 @@ class Build(unittest.TestCase):
         # a freshly published repo with no mods must still get a valid index
         self._build(ingest=True, prune=True)
         self.assertEqual(self._read("repository.json"),
-                         {"index_version": 1, "mods": {}})
+                         {"index_version": 2, "mods": {}})
 
     def test_invalid_submission_blocks_build(self):
         self._submit(manifest("Owner.Repo", version="nope"))
         with self.assertRaises(mi.ValidationError):
             self._build()
+
+    def test_v1_submission_blocks_build(self):
+        self._submit(ManifestVersion()._v1())
+        with self.assertRaises(mi.ValidationError) as cm:
+            self._build()
+        self.assertIn("manifest_version 1 is the old format", str(cm.exception))
+
+    def test_compiled_manifest_without_package_blocks_build(self):
+        # ingest always sets it, so one without it was hand-placed
+        mi._write_json(os.path.join(self.root, "manifests", "Owner", "Repo", "1.0.0.json"),
+                       manifest())
+        with self.assertRaises(mi.ValidationError) as cm:
+            self._build(ingest=False, prune=False)
+        self.assertIn("no package", str(cm.exception))
 
     def test_template_is_ignored(self):
         # The reserved TEMPLATE.json holds placeholder (structurally invalid)
@@ -555,45 +964,67 @@ class Build(unittest.TestCase):
         self.assertTrue(os.path.exists(tmpl))        # left in place, not pruned
         self.assertEqual(set(self._read("repository.json")["mods"]), {"Owner.Repo"})
         # only the template remains under submissions/; validate skips it and passes
-        rc = mi.cmd_validate(argparse.Namespace(
-            repo=self.root, paths=None, vt_max_malicious=None))
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = mi.cmd_validate(argparse.Namespace(
+                repo=self.root, paths=None, vt_max_malicious=None))
         self.assertEqual(rc, 0)
+
+    def test_repo_template_is_a_v2_shape(self):
+        """submissions/TEMPLATE.json is what submitters copy, so apart from its
+        placeholder hash it has to be a valid v2 manifest."""
+        path = os.path.join(os.path.dirname(HERE), "submissions", "TEMPLATE.json")
+        with open(path, encoding="utf-8") as f:
+            tmpl = json.load(f)
+        errs = mi.validate_structure(tmpl)
+        self.assertEqual(errs, ["artifacts[0].sha256 must be 64 lowercase hex characters"])
+        self.assertEqual(tmpl["artifacts"][0]["targets"], ["pc", "server"])
 
 
 class FillHashes(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix="modindex_fill_")
-        self.addCleanup(lambda: __import__("shutil").rmtree(self.root, ignore_errors=True))
-
-    def test_fill_writes_hashes_from_urls(self):
+        self.addCleanup(lambda: shutil.rmtree(self.root, ignore_errors=True))
         # stub the network: hash is derived from the URL so we can assert it
         saved = mi._sha256_of_url
         mi._sha256_of_url = lambda url: hashlib.sha256(url.encode()).hexdigest()
-        try:
-            m = manifest(sha256="PLACEHOLDER", library_dependencies=[
-                {"name": "L", "download_url": "https://x/L.dll",
-                 "sha256": "PLACEHOLDER", "filename": "L.dll"}])
-            path = os.path.join(self.root, "submissions", m["id"], f'{m["version"]}.json')
-            mi._write_json(path, m)
+        self.addCleanup(lambda: setattr(mi, "_sha256_of_url", saved))
 
+    def _fill(self, m):
+        path = os.path.join(self.root, "submissions", m["id"], f'{m["version"]}.json')
+        mi._write_json(path, m)
+        with contextlib.redirect_stdout(io.StringIO()):
             rc = mi.cmd_fill(argparse.Namespace(repo=self.root, paths=[path]))
-            self.assertEqual(rc, 0)
+        with open(path, encoding="utf-8") as f:
+            return rc, json.load(f)
 
-            out = json.load(open(path, encoding="utf-8"))
-            self.assertEqual(out["sha256"], hashlib.sha256(m["download_url"].encode()).hexdigest())
-            self.assertEqual(out["library_dependencies"][0]["sha256"],
-                             hashlib.sha256(b"https://x/L.dll").hexdigest())
-            # a filled manifest then passes structural validation
-            self.assertEqual(mi.validate_structure(out), [])
-        finally:
-            mi._sha256_of_url = saved
+    def test_fill_writes_every_artifact_and_library_hash(self):
+        m = manifest(artifacts=[
+            artifact(targets=["pc"], asset="Repo-pc.dll", sha256="PLACEHOLDER",
+                     library_dependencies=[library("A", sha="PLACEHOLDER")]),
+            artifact(targets=["server"], asset="Repo-server.zip", sha256="PLACEHOLDER",
+                     library_dependencies=[library("B", sha="PLACEHOLDER")])])
+        rc, out = self._fill(m)
+        self.assertEqual(rc, 0)
+        want = lambda url: hashlib.sha256(url.encode()).hexdigest()
+        for art in out["artifacts"]:
+            self.assertEqual(art["sha256"], want(art["download_url"]))
+            for lib in art["library_dependencies"]:
+                self.assertEqual(lib["sha256"], want(lib["download_url"]))
+        # a filled manifest then passes structural validation
+        self.assertEqual(mi.validate_structure(out), [])
+
+    def test_v1_file_is_refused_and_left_alone(self):
+        rc, out = self._fill(ManifestVersion()._v1())
+        self.assertEqual(rc, 1)
+        self.assertEqual(out, ManifestVersion()._v1())
 
 
-class DependencySides(unittest.TestCase):
-    """A dependency has to be able to run somewhere the mod requiring it runs.
+class DependencyTargets(unittest.TestCase):
+    """A dependency has to have a build for a target the mod requiring it has.
 
-    The distinction this class exists to pin down: 'the sides differ' is normal
-    and allowed, 'the sides don't overlap at all' is a dead edge and rejected."""
+    The distinction this class exists to pin down: 'the targets differ' is
+    normal and allowed, 'the targets don't overlap at all' is a dead edge and
+    rejected."""
 
     def _known(self, *manifests):
         known = {}
@@ -602,63 +1033,76 @@ class DependencySides(unittest.TestCase):
         return known
 
     def _check(self, m, *known):
-        return mi.validate_dependency_sides(m, self._known(*known))
+        return mi.validate_dependency_targets(m, self._known(*known))
 
     # -- the shape that must keep working ------------------------------------
 
-    def test_dual_side_mod_may_depend_on_client_only_mod(self):
-        """The motivating case for side-filtered resolution. A mod running on
-        both sides whose client half needs a client-only support mod is normal,
-        not an error: the launcher leaves the dependency out on the server."""
-        dep = manifest("Dev.UIKit", "1.0.0", client_side=True, server_side=False)
+    def test_pc_and_server_mod_may_depend_on_pc_only_mod(self):
+        """The motivating case for per-target resolution. A mod with pc and
+        server builds whose pc build needs a pc-only support mod is normal, not
+        an error: installers leave the dependency out on the server."""
+        dep = manifest("Dev.UIKit", "1.0.0", targets=["pc"])
         mod = manifest("Dev.Dual", "1.0.0", dependencies={"Dev.UIKit": "1.0.0"})
         errs, warns = self._check(mod, dep)
         self.assertEqual(errs, [])
         self.assertEqual(len(warns), 1)
-        self.assertIn("server", warns[0])       # names the side that goes without
+        self.assertIn("server build will load without it", warns[0])
 
-    def test_dual_side_mod_may_depend_on_server_only_mod(self):
-        dep = manifest("Dev.DbTools", "1.0.0", client_side=False, server_side=True)
+    def test_pc_and_server_mod_may_depend_on_server_only_mod(self):
+        dep = manifest("Dev.DbTools", "1.0.0", targets=["server"])
         mod = manifest("Dev.Dual", "1.0.0", dependencies={"Dev.DbTools": "1.0.0"})
         errs, warns = self._check(mod, dep)
         self.assertEqual(errs, [])
-        self.assertIn("client", warns[0])
+        self.assertIn("pc build", warns[0])
 
-    def test_matching_sides_are_silent(self):
+    def test_split_builds_count_as_their_union(self):
+        # Two artifacts are one mod for this rule: pc + server, then quest.
+        dep = manifest("Dev.UIKit", "1.0.0", targets=["pc"])
+        mod = manifest("Dev.Split", "1.0.0", dependencies={"Dev.UIKit": "1.0.0"},
+                       artifacts=[artifact("Dev", "Split", targets=["server"]),
+                                  artifact("Dev", "Split", targets=["pc", "quest"])])
+        errs, warns = self._check(mod, dep)
+        self.assertEqual(errs, [])
+        self.assertIn("quest+server builds will load without it", warns[0])
+
+    def test_matching_targets_are_silent(self):
         dep = manifest("Dev.Shared", "1.0.0")
         mod = manifest("Dev.Mod", "1.0.0", dependencies={"Dev.Shared": "1.0.0"})
         self.assertEqual(self._check(mod, dep), ([], []))
 
+    def test_a_dependency_with_more_targets_is_silent(self):
+        dep = manifest("Dev.Shared", "1.0.0", targets=["pc", "server", "quest"])
+        mod = manifest("Dev.Mod", "1.0.0", targets=["pc"],
+                       dependencies={"Dev.Shared": "1.0.0"})
+        self.assertEqual(self._check(mod, dep), ([], []))
+
     # -- the dead edges ------------------------------------------------------
 
-    def test_server_only_mod_depending_on_client_only_mod_is_rejected(self):
-        dep = manifest("Dev.UIKit", "1.0.0", client_side=True, server_side=False)
-        mod = manifest("Dev.Srv", "1.0.0", client_side=False, server_side=True,
-                       dependencies={"Dev.UIKit": "1.0.0"})
-        errs, warns = self._check(mod, dep)
-        self.assertEqual(len(errs), 1)
-        self.assertIn("never share a process", errs[0])
-
-    def test_client_only_mod_depending_on_server_only_mod_is_rejected(self):
-        dep = manifest("Dev.DbTools", "1.0.0", client_side=False, server_side=True)
-        mod = manifest("Dev.Cli", "1.0.0", client_side=True, server_side=False,
-                       dependencies={"Dev.DbTools": "1.0.0"})
-        self.assertEqual(len(self._check(mod, dep)[0]), 1)
+    def test_no_shared_target_is_rejected(self):
+        for mine, theirs in ((["server"], ["pc"]), (["pc"], ["server"]),
+                             (["quest"], ["pc", "server"]), (["pc", "server"], ["quest"])):
+            with self.subTest(mine=mine, theirs=theirs):
+                dep = manifest("Dev.Kit", "1.0.0", targets=theirs)
+                mod = manifest("Dev.Mod", "1.0.0", targets=mine,
+                               dependencies={"Dev.Kit": "1.0.0"})
+                errs, warns = self._check(mod, dep)
+                self.assertEqual(len(errs), 1)
+                self.assertIn("share no target", errs[0])
 
     # -- resolution ----------------------------------------------------------
 
     def test_checks_the_version_the_launcher_would_install(self):
         """Major-locked, highest >= the minimum - so a later, fixed release in
         the same major is what gets judged, not the one the author named."""
-        bad = manifest("Dev.Kit", "1.0.0", client_side=True, server_side=False)
-        good = manifest("Dev.Kit", "1.5.0")          # both sides, and higher
-        mod = manifest("Dev.Srv", "1.0.0", client_side=False, server_side=True,
+        bad = manifest("Dev.Kit", "1.0.0", targets=["pc"])
+        good = manifest("Dev.Kit", "1.5.0")          # pc + server, and higher
+        mod = manifest("Dev.Srv", "1.0.0", targets=["server"],
                        dependencies={"Dev.Kit": "1.0.0"})
         self.assertEqual(self._check(mod, bad, good), ([], []))
 
     def test_other_major_is_not_consulted(self):
         other = manifest("Dev.Kit", "2.0.0")         # fine, but wrong major
-        mod = manifest("Dev.Srv", "1.0.0", client_side=False, server_side=True,
+        mod = manifest("Dev.Srv", "1.0.0", targets=["server"],
                        dependencies={"Dev.Kit": "1.0.0"})
         errs, warns = self._check(mod, other)
         self.assertEqual(errs, [])                   # unresolvable, so unjudged
@@ -676,40 +1120,93 @@ class DependencySides(unittest.TestCase):
         self.assertTrue(mi.validate_structure(mod))   # reported there instead
 
 
-class BuildEnforcesDependencySides(unittest.TestCase):
+class BuildEnforcesDependencyTargets(unittest.TestCase):
     def setUp(self):
-        self.root = tempfile.mkdtemp(prefix="modindex_sides_")
-        self.addCleanup(lambda: __import__("shutil").rmtree(self.root, ignore_errors=True))
-        saved = mi._sniff_package_from_url
-        mi._sniff_package_from_url = lambda url: "dll"
-        self.addCleanup(lambda: setattr(mi, "_sniff_package_from_url", saved))
+        self.root = tempfile.mkdtemp(prefix="modindex_targets_")
+        self.addCleanup(lambda: shutil.rmtree(self.root, ignore_errors=True))
 
     def _write_manifest(self, m):
         author, repo = m["id"].split(".", 1)
+        for a in m["artifacts"]:
+            a.setdefault("package", "dll")          # as ingest would have set it
         mi._write_json(os.path.join(self.root, "manifests", author, repo,
                                     f'{m["version"]}.json'), m)
 
     def _build(self):
-        return mi.cmd_build(argparse.Namespace(repo=self.root, ingest=False, prune=False))
+        with contextlib.redirect_stdout(io.StringIO()):
+            return mi.cmd_build(argparse.Namespace(repo=self.root, ingest=False, prune=False))
 
     def test_build_refuses_to_index_an_unsatisfiable_edge(self):
-        self._write_manifest(manifest("Dev.UIKit", "1.0.0",
-                                      client_side=True, server_side=False))
-        self._write_manifest(manifest("Dev.Srv", "1.0.0",
-                                      client_side=False, server_side=True,
+        self._write_manifest(manifest("Dev.UIKit", "1.0.0", targets=["pc"]))
+        self._write_manifest(manifest("Dev.Srv", "1.0.0", targets=["server"],
                                       dependencies={"Dev.UIKit": "1.0.0"}))
         with self.assertRaises(mi.ValidationError) as cm:
             self._build()
         self.assertIn("Dev.Srv", str(cm.exception))
         self.assertFalse(os.path.isfile(os.path.join(self.root, "repository.json")))
 
-    def test_build_allows_a_dual_side_mod_with_a_client_only_dependency(self):
-        self._write_manifest(manifest("Dev.UIKit", "1.0.0",
-                                      client_side=True, server_side=False))
+    def test_build_allows_a_pc_and_server_mod_with_a_pc_only_dependency(self):
+        self._write_manifest(manifest("Dev.UIKit", "1.0.0", targets=["pc"]))
         self._write_manifest(manifest("Dev.Dual", "1.0.0",
                                       dependencies={"Dev.UIKit": "1.0.0"}))
         self._build()
         self.assertTrue(os.path.isfile(os.path.join(self.root, "repository.json")))
+
+
+class ReferenceFixtures(unittest.TestCase):
+    """The three manifests and the index in tests/fixtures/v2/ were generated
+    straight from docs/REPO_STRUCTURE.md by an independent script, for a local
+    test repo (so their URLs are http:// on 127.0.0.1, which only the URL
+    rules care about). They pin this tool to the same reading of the spec as
+    the launcher's and TavernLib's implementations."""
+
+    def _manifests(self):
+        out = []
+        for path in sorted(glob.glob(os.path.join(FIXTURES, "manifests", "*", "*", "*.json"))):
+            with open(path, encoding="utf-8") as f:
+                out.append(json.load(f))
+        self.assertEqual(len(out), 3)
+        return out
+
+    def test_structure_passes_once_url_rules_are_set_aside(self):
+        for m in self._manifests():
+            with self.subTest(m["id"]):
+                self.assertEqual(mi.validate_structure(m, check_urls=False), [])
+                # and the URL rules are the ONLY thing they fail
+                for e in mi.validate_structure(m):
+                    self.assertIn("download_url must be an https:// URL", e)
+
+    def test_written_in_canonical_order(self):
+        for m in self._manifests():
+            with self.subTest(m["id"]):
+                self.assertEqual(json.dumps(mi.ordered_manifest(m)), json.dumps(m))
+
+    def test_build_reproduces_the_reference_index(self):
+        """Rehost each build on its own GitHub repo (a URL is the one thing the
+        fixtures can't satisfy), compile, and compare to the reference index,
+        key order included. Libraries go to an unowned https host, as allowed."""
+        root = tempfile.mkdtemp(prefix="modindex_fixtures_")
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        for m in self._manifests():
+            author, repo = mi.parse_id(m["id"])
+            for a in m["artifacts"]:
+                a["download_url"] = (f"https://github.com/{author}/{repo}/releases/download/"
+                                     f"v{m['version']}/{a['download_url'].rsplit('/', 1)[1]}")
+                for lib in a["library_dependencies"]:
+                    lib["download_url"] = "https://example.com/" + lib["filename"]
+            mi._write_json(os.path.join(root, "manifests", author, repo,
+                                        f"{m['version']}.json"), m)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mi.cmd_build(argparse.Namespace(repo=root, ingest=False, prune=False))
+        # ExampleMod (pc+server, quest) depends on PcHelper (pc): a note, not an error
+        self.assertIn("ExampleDev.PcHelper 1.0.0 has builds for pc only", out.getvalue())
+        with open(os.path.join(root, "repository.json"), encoding="utf-8") as f:
+            built = json.load(f)
+        with open(os.path.join(FIXTURES, "repository.json"), encoding="utf-8") as f:
+            reference = json.load(f)
+        self.assertEqual(json.dumps(built, ensure_ascii=False),
+                         json.dumps(reference, ensure_ascii=False))
 
 
 if __name__ == "__main__":
