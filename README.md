@@ -1,6 +1,6 @@
 # CommunityMods
 
-The default mod index for The Modding Tavern modding through TavernLauncher. Every launcher trusts this repo out of the box, so you can browse and install what's here straight from the **Community Mods** menu with no setup.
+The default mod index for The Modding Tavern modding through TavernLauncher. Every launcher trusts this repo out of the box, so you can browse and install what's here straight from the launcher's **Mod Manager** with no setup.
 
 Nothing here runs. It's a set of static JSON files that say where each mod's files live (in the mods' own GitHub releases) and how to install them. The launcher reads them directly, so any plain static host works and there's no backend to keep alive.
 
@@ -18,7 +18,9 @@ docs/                                  the schema and the submission process
 
 ## For players
 
-You don't need anything here directly, the launcher already points at it. Open **Mods > Community Mods** and install. You can add other sources under **Manage Sources**, but nobody checks those, so the launcher warns you when you do: a mod is a `.dll` that runs with full access to your machine, so only add sources you trust.
+You don't need anything here directly, the launcher already points at it. Press **Mod Manager**, then **Community Mods**, and install. The Mod Manager itself lists what you already have — enable, disable, remove, or change a mod's version there.
+
+You can add other sources under **Manage Sources** (inside Community Mods), but nobody checks those, so the launcher warns you when you do: a mod is a `.dll` that runs with full access to your machine, so only add sources you trust.
 
 ## For mod authors
 
@@ -26,7 +28,9 @@ Want your mod in the default list? See [docs/SUBMITTING.md](docs/SUBMITTING.md) 
 
 ## For your own source
 
-The launcher reads any repo that serves the layout in [docs/REPO_STRUCTURE.md](docs/REPO_STRUCTURE.md). No GitHub Actions, no special hosting, just static JSON at stable URLs. Users add your source by its raw-content base URL under **Manage Sources**. This repo is one such source with a review process on top and some automations to make it easier for all of us.
+The launcher reads any repo that serves the layout in [docs/REPO_STRUCTURE.md](docs/REPO_STRUCTURE.md). No GitHub Actions, no special hosting, just static JSON at stable URLs. Users add your source by its raw-content base URL under **Manage Sources**; a headless server operator adds it with the `modmanager addrepo <url>` console command.
+
+Copy [tools/page.html](tools/page.html), [tools/modindex.py](tools/modindex.py), and [.github/workflows/pages.yml](.github/workflows/pages.yml), then set **Settings → Pages → Source** to *GitHub Actions*, to get a browsable list of your own mods. The page is baked from your manifests after each index rebuild and deployed straight to Pages; nothing generated is ever committed. This repo is one such source with a review process on top and some automations to make it easier for all of us.
 
 ## Trust
 

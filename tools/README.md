@@ -10,6 +10,7 @@ You don't need any of this to host your own source, a third-party repo only has 
 python tools/modindex.py fill-hashes [paths...]
 python tools/modindex.py validate [paths...] [--vt-max-malicious N]
 python tools/modindex.py build [--ingest] [--prune]
+python tools/modindex.py site [--out DIR]
 ```
 
 ### fill-hashes
@@ -24,9 +25,15 @@ Layer 1, runs on every submission PR. Validates submission manifests (default: e
 
 The index compiler, runs on merge to `main`. Reads every `manifests/**/<version>.json` and regenerates each mod's `latest.json` / `latest.<major>.json` pointers and the top-level `repository.json` (a slim summary per major with a `versions` list, no urls/hashes/deps). With `--ingest` it first validates and moves `submissions/**/*.json` into `manifests/<author>/<repo>/<version>.json`, and `--prune` then deletes the moved files. It's idempotent, running it with no new submissions rewrites the same bytes.
 
+### site
+
+Bakes the browsable page: [page.html](page.html) with the mod list injected into it, written to `site/index.html` (gitignored — it's deployed as a Pages artifact, never committed). Reads `manifests/` rather than `repository.json`, because the page shows `screenshots`, which the index's slim summary deliberately doesn't carry. Screenshot URLs are vetted here (see `_screenshot_ok`), so an unpublishable one is dropped with a printed reason at build time rather than trusted in a visitor's browser.
+
+Runs in its own workflow, chained after `build` — so the page only ever describes an index that actually compiled. Open `page.html` directly to work on the styling: it renders the whole page with an empty list.
+
 ## Keeping the rules in sync
 
-The validation rules here mirror the launcher's parser (`TavernLauncher/modmanager.py`) and the schema in `docs/REPO_STRUCTURE.md`. Change one, change all three. The client and the repo have to agree on what a valid manifest is.
+The validation rules here mirror two parsers and one schema: the launcher's (`TavernLauncher/tavern_shared/mods/manifest.py`, with resolution in `resolve.py` and installation in `install.py`), TavernLib's native one for headless servers (`Backend/Mods/ModDataModel.cs`), and `docs/REPO_STRUCTURE.md`. Change one, change all four. A manifest this repo accepts has to be one both installers accept.
 
 ## GitHub Actions
 
