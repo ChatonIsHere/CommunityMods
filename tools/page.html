@@ -5,8 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Community Mods — The Modding Tavern</title>
 <meta name="description" content="Browse the mods in this Modding Tavern index.">
-<!-- Template: `modindex.py site` bakes the mod list into MODS below. Opened
-     directly, it renders with an empty list. -->
+<!-- `modindex.py site` bakes the mod list into MODS below. -->
 <style>
   :root {
     --background: #1a1210;
@@ -20,7 +19,6 @@
     --accent: #6ab0aa;
     --success: #6aaa72;
     --violet: #b9a0dc;
-    /* the launcher's red, lightened to pass WCAG AA on a card */
     --danger: #e08585;
     --ring: rgba(232, 168, 64, .35);
     --radius: .5rem;
@@ -75,7 +73,6 @@
     background: var(--card); border: 1px solid var(--border);
     border-radius: var(--radius); overflow: hidden;
   }
-  /* shows the mod's name when there's no screenshot */
   .shot {
     aspect-ratio: 16 / 9;
     display: grid; place-items: center;
@@ -92,7 +89,6 @@
     display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden;
   }
 
-  /* fixed layout: long text is clipped, with the full text on hover */
   table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: .82rem; }
   thead th {
     position: sticky; top: 0; z-index: 1;
@@ -156,7 +152,6 @@
 </div>
 
 <script>
-// One row per mod at its highest version, sorted by name.
 const MODS = /*__MODS__*/[];
 
 const el = (id) => document.getElementById(id);

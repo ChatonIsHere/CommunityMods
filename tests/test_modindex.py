@@ -449,6 +449,15 @@ class Validate(unittest.TestCase):
         self.assertIn("FAIL  artifacts[1] (server): zip bundle has .dll files only in subfolders",
                       out)
 
+    def test_a_published_version_cannot_be_resubmitted(self):
+        published = manifest()
+        published["artifacts"][0]["package"] = "dll"
+        mi._write_json(os.path.join(self.root, "manifests", "Owner", "Repo", "1.0.0.json"), published)
+        rc, out = self.validate(self.split([("Repo.dll", b"MZ server")]))
+        self.assertEqual(rc, 1)
+        self.assertIn("FAIL  Owner.Repo 1.0.0 is already published", out)
+        self.assertEqual(self.scanned, [])
+
     def test_v1_submission_fails_with_the_migration_message(self):
         rc, out = self.validate(v1_manifest())
         self.assertEqual(rc, 1)
@@ -641,6 +650,15 @@ class Build(unittest.TestCase):
                 with self.assertRaises(mi.ValidationError) as cm:
                     self.build()
                 self.assertIn(needle, str(cm.exception))
+
+    def test_ingest_never_overwrites_a_published_manifest(self):
+        self.place(manifest(description="published"))
+        self.submit(manifest(description="resubmitted"))
+        with self.assertRaises(mi.ValidationError) as cm:
+            self.build()
+        self.assertIn("would overwrite", str(cm.exception))
+        self.assertEqual(self.read("manifests", "Owner", "Repo", "1.0.0.json")["description"],
+                         "published")
 
     def test_dependency_targets_are_enforced_repo_wide(self):
         self.place(manifest("Dev.UIKit", targets=["pc"]))
