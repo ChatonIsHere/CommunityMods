@@ -5,27 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Community Mods — The Modding Tavern</title>
 <meta name="description" content="Browse the mods in this Modding Tavern index.">
-<!--
-  The template for this repo's mod browser. `modindex.py site` bakes the mod
-  list into the MODS marker below and writes the result to site/index.html,
-  which is what GitHub Pages serves; the page itself fetches nothing at
-  runtime, so there's no request to fail, no CORS question, and no partly
-  rendered page while an index downloads.
-
-  Baked rather than live on purpose: the data is only allowed to change when
-  the index rebuild that produced it succeeded, and screenshot URLs are vetted
-  at bake time (see _screenshot_ok in modindex.py) rather than trusted at
-  render time.
-
-  Opening THIS file directly renders the page chrome with an empty list, which
-  is what makes it editable for styling without running the generator.
-
-  Any repo serving docs/REPO_STRUCTURE.md's layout can copy this file, the
-  tool, and the workflow to get the same page.
-
-  Styling is shadcn's token system and component anatomy (card / badge /
-  input / table), with the palette swapped for TavernLauncher's own.
--->
+<!-- Template: `modindex.py site` bakes the mod list into MODS below. Opened
+     directly, it renders with an empty list. -->
 <style>
   :root {
     --background: #1a1210;
@@ -39,8 +20,7 @@
     --accent: #6ab0aa;
     --success: #6aaa72;
     --violet: #b9a0dc;
-    /* The launcher's RED is 4.01:1 on a card, under AA, so this is that hue
-       lifted until it clears it. */
+    /* the launcher's red, lightened to pass WCAG AA on a card */
     --danger: #e08585;
     --ring: rgba(232, 168, 64, .35);
     --radius: .5rem;
@@ -58,7 +38,6 @@
   }
   .wrap { padding: 1.25rem 1.5rem 3rem; }
 
-  /* header: title left, controls right, one row until it can't be */
   header {
     display: flex; flex-wrap: wrap; align-items: flex-end; gap: 1rem;
     border-bottom: 1px solid var(--border);
@@ -66,11 +45,10 @@
   }
   .titles { flex: 1 1 20rem; min-width: 0; }
   h1 { font: 700 1.35rem/1.2 var(--serif); color: var(--primary); margin: 0 0 .15rem; }
-  .lede { color: var(--foreground); margin: 0; font-size: .82rem; }
+  .lede { margin: 0; font-size: .82rem; }
   .lede code { font: .78rem var(--mono); color: var(--accent); }
   .controls { display: flex; gap: .5rem; align-items: center; }
 
-  /* input */
   .input {
     width: 17rem; padding: .35rem .6rem;
     background: var(--card); border: 1px solid var(--border);
@@ -80,7 +58,6 @@
   .input::placeholder { color: var(--muted-foreground); }
   .input:focus { outline: none; border-color: var(--primary-dim); box-shadow: 0 0 0 3px var(--ring); }
 
-  /* segmented view toggle */
   .segmented { display: flex; border: 1px solid var(--border); border-radius: calc(var(--radius) - 2px); overflow: hidden; }
   .segmented button {
     padding: .35rem .75rem; border: 0; cursor: pointer;
@@ -92,14 +69,13 @@
 
   .count { color: var(--muted-foreground); font-size: .78rem; margin-bottom: .6rem; }
 
-  /* card view */
   .grid { display: grid; gap: .7rem; grid-template-columns: repeat(auto-fill, minmax(13.5rem, 1fr)); }
   .card {
     display: flex; flex-direction: column;
     background: var(--card); border: 1px solid var(--border);
     border-radius: var(--radius); overflow: hidden;
   }
-  /* Screenshot slot. Holds the mod's name until the mod publishes one. */
+  /* shows the mod's name when there's no screenshot */
   .shot {
     aspect-ratio: 16 / 9;
     display: grid; place-items: center;
@@ -112,13 +88,11 @@
   .card-title { font: 700 .92rem/1.25 var(--serif); }
   .card-meta { font-size: .74rem; color: var(--muted-foreground); }
   .card-desc {
-    font-size: .78rem; color: var(--foreground); flex: 1; margin: .1rem 0 .25rem;
+    font-size: .78rem; flex: 1; margin: .1rem 0 .25rem;
     display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden;
   }
 
-  /* table view. Fixed layout so a long description is clipped to its column
-     instead of stretching the table sideways; every cell truncates the same
-     way, with the full text on hover where it can plausibly overflow. */
+  /* fixed layout: long text is clipped, with the full text on hover */
   table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: .82rem; }
   thead th {
     position: sticky; top: 0; z-index: 1;
@@ -140,10 +114,7 @@
   td.name { font-weight: 600; }
   td.ver { color: var(--primary); font-family: var(--mono); }
   td.id { font: .74rem var(--mono); color: var(--muted-foreground); }
-  td.desc { color: var(--foreground); }
-  .dim { color: var(--muted-foreground); }
 
-  /* badge */
   .badges { display: flex; flex-wrap: wrap; gap: .25rem; }
   .badge {
     padding: .05rem .4rem; border: 1px solid var(--border); border-radius: 999px;
@@ -154,10 +125,7 @@
   .badge.server { color: var(--success); border-color: var(--success); }
   .badge.quest { color: var(--violet); border-color: var(--violet); }
   .badge.parity { color: var(--danger); border-color: var(--danger); }
-  /* Every tag explains itself on hover, so the page needs no legend. */
   .badge[title] { cursor: help; }
-  /* In a table row the tags must stay on one line, or a wrap grows the row and
-     costs the density the table view exists for. */
   td .badges { flex-wrap: nowrap; }
 
   .note { color: var(--muted-foreground); padding: 1.5rem 0; }
@@ -188,25 +156,15 @@
 </div>
 
 <script>
-// Baked by `modindex.py site`, already collapsed to one row per mod at its
-// highest version and sorted by name — so nothing here resolves, compares
-// versions, or sorts. Empty in the template itself.
+// One row per mod at its highest version, sorted by name.
 const MODS = /*__MODS__*/[];
 
 const el = (id) => document.getElementById(id);
 const text = (s) => String(s ?? "");
 
-// What a mod is, and what it demands of you: one tag per fact, shown only when
-// true, so "PC" and "Server" both appearing IS the runs-everywhere case rather
-// than a third spelling of it. A target tag means the mod has a build for that
-// kind of process (its manifest's artifacts). Each carries its own short
-// explanation, because a legend at the top of the page is a thing nobody
-// scrolls back to.
 const hasTarget = (m, t) => (m.targets || []).includes(t);
 
-// Parity only does anything when a server runs the mod and a client has a
-// build to match it with (docs/REPO_STRUCTURE.md, "Joining a server"), so the
-// tag only appears there rather than claiming something it can't enforce.
+// Parity is only enforced on a mod a server runs that also has a client build.
 const parityApplies = (m) =>
   m.parity_required && hasTarget(m, "server") && (hasTarget(m, "pc") || hasTarget(m, "quest"));
 
@@ -226,8 +184,7 @@ const tags = (parent, m) => {
   return parent;
 };
 
-// textContent throughout, never innerHTML with data: these strings come from
-// mod authors, and rendering them as markup would be a hole for no benefit.
+// textContent only: these strings come from mod authors.
 const put = (parent, tag, cls, value) => {
   const node = document.createElement(tag);
   if (cls) node.className = cls;
@@ -274,13 +231,11 @@ const table = (list) => {
     put(row, "td", null, m.author);
     put(row, "td", "ver", m.latest);
     tags(put(put(row, "td"), "div", "badges"), m);
-    put(row, "td", "desc", m.description).title = text(m.description);
+    put(row, "td", null, m.description).title = text(m.description);
   }
   return node;
 };
 
-// Remembered, because which view suits you is a preference, not a per-visit
-// decision. Falls back to cards if storage is unavailable (private mode).
 let view = "cards";
 try { view = localStorage.getItem("view") || "cards"; } catch {}
 
