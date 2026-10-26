@@ -755,6 +755,45 @@ class FillHashes(unittest.TestCase):
         self.assertEqual(self.fill(v1_manifest()), (1, v1_manifest()))
 
 
+class VersionFloor(unittest.TestCase):
+    KNOWN = {"Owner.Repo": {"1.2.0": {}, "2.0.0": {}, "10.0.0": {}}}
+
+    def floor(self, version):
+        return mi.version_floor_error({"id": "Owner.Repo", "version": version}, self.KNOWN)
+
+    def test_new_mod_takes_any_version(self):
+        self.assertIsNone(mi.version_floor_error({"id": "New.Mod", "version": "0.0.1"}, self.KNOWN))
+
+    def test_an_existing_version_is_refused(self):
+        self.assertIn("already published", self.floor("2.0.0"))
+
+    def test_lower_than_its_majors_highest_is_refused(self):
+        self.assertIn("lower than 1.2.0, the highest published 1.x", self.floor("1.1.9"))
+
+    def test_a_fix_to_an_older_major_is_allowed(self):
+        self.assertIsNone(self.floor("1.2.1"))
+        self.assertIsNone(self.floor("2.0.1"))
+
+    def test_a_new_major_below_the_newest_is_refused(self):
+        self.assertIn("would start major 3, below the newest published version 10.0.0", self.floor("3.0.0"))
+
+    def test_a_new_highest_major_is_allowed(self):
+        self.assertIsNone(self.floor("11.0.0"))
+
+    def test_validate_refuses_a_lower_version(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root)
+        published = manifest(version="1.2.0")
+        mi._write_json(os.path.join(root, "manifests", "Owner", "Repo", "1.2.0.json"), published)
+        path = os.path.join(root, "submissions", "Owner.Repo", "1.1.0.json")
+        mi._write_json(path, manifest(version="1.1.0"))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = mi.cmd_validate(argparse.Namespace(repo=root, paths=[path], vt_max_malicious=None))
+        self.assertEqual(rc, 1)
+        self.assertIn("FAIL  Owner.Repo 1.1.0 is lower than 1.2.0", out.getvalue())
+
+
 class DependencyTargets(unittest.TestCase):
     """Differing targets are allowed (with a note); no shared target is an error."""
 
