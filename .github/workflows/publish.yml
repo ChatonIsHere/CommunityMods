@@ -1,8 +1,12 @@
 name: Publish index
 
-# Runs after a submission merges to main. Ingests submissions/ manifests into
-# manifests/<author>/<repo>/, regenerates the latest*.json pointers and
-# repository.json, and commits the result.
+# After a merge to main: ingest submissions/ into manifests/, rebuild the
+# latest*.json pointers and repository.json, and commit the result.
+#
+# main is protected, so the push uses a token from a GitHub App on the ruleset
+# bypass list. Its client id and private key live as PUBLISH_APP_CLIENT_ID and
+# PUBLISH_APP_PRIVATE_KEY in the "publish" environment, limited to main, so a
+# workflow on any other branch can't read them.
 
 on:
   push:
@@ -13,66 +17,54 @@ on:
       - "tools/**"
   workflow_dispatch:
 
-# main is protected, so the default GITHUB_TOKEN can't push here. Uses a token
-# from a dedicated GitHub App that's on the ruleset bypass list instead. Needs
-# two secrets: PUBLISH_APP_ID and PUBLISH_APP_PRIVATE_KEY (the app's private key
-# .pem). The app only needs Contents: Read and write on this repo.
 permissions:
   contents: read
 
-# Serializes index builds so two runs never edit manifests/ or repository.json
-# at once. Runs queue rather than cancel, since each build is a full rebuild and
-# still picks up every merged submission even after a queued run is superseded.
+# One build at a time; a queued run still sees every merge, so never cancel.
 concurrency:
   group: publish-index
   cancel-in-progress: false
 
 jobs:
   build:
+    # The app's own commit (unlike GITHUB_TOKEN's) triggers this workflow again.
+    if: github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'chore(index)')
     runs-on: ubuntu-latest
+    environment: publish
     steps:
-      - name: Mint a token from the publish app (on the ruleset bypass list)
-        id: app-token
+      - id: app-token
         uses: actions/create-github-app-token@v3
         with:
-          app-id: ${{ secrets.PUBLISH_APP_ID }}
+          client-id: ${{ secrets.PUBLISH_APP_CLIENT_ID }}
           private-key: ${{ secrets.PUBLISH_APP_PRIVATE_KEY }}
+          permission-contents: write
 
       - uses: actions/checkout@v7
         with:
-          # Use the app token as the git credential so the commit and push
-          # below are made by the app, bypassing branch protection.
           token: ${{ steps.app-token.outputs.token }}
 
       - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
 
-      - name: Compile index (ingest approved submissions)
-        run: python tools/modindex.py build --ingest --prune
-
-      - name: Commit regenerated index
+      - name: Rebuild the index and push it
         run: |
           git config user.name '${{ steps.app-token.outputs.app-slug }}[bot]'
           git config user.email '${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com'
-          git add -A
-          if git diff --cached --quiet; then
-            echo "Index already up to date, nothing to commit."
-            exit 0
-          fi
-          git commit -m "chore(index): rebuild after merge"
-          # Guards the rare case of another commit landing on main between our
-          # checkout and push: rebase onto it, rebuild, and retry.
-          for attempt in 1 2 3 4 5; do
-            if git push; then
-              echo "pushed on attempt $attempt"
-              exit 0
-            fi
-            echo "push rejected; rebasing onto latest main and rebuilding"
-            git pull --rebase origin main
+          # If another commit lands first, rebuild from the new tip and retry.
+          for attempt in 1 2 3; do
             python tools/modindex.py build --ingest --prune
             git add -A
-            git diff --cached --quiet || git commit --amend --no-edit
+            if git diff --cached --quiet; then
+              echo "Index already up to date."
+              exit 0
+            fi
+            git commit -m "chore(index): rebuild after merge"
+            if git push; then
+              exit 0
+            fi
+            git fetch origin main
+            git reset --hard origin/main
           done
-          echo "could not push index after retries" >&2
+          echo "could not push the index" >&2
           exit 1

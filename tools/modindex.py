@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-modindex: validates CommunityMods submissions and compiles the static index.
+modindex: validates TavernMods submissions and compiles the static index.
 
   fill-hashes [paths]   write the real sha256 of every artifact and library
   validate [paths]      check submissions, downloading and hashing every file
@@ -75,8 +75,8 @@ ZIP_RATIO_MIN_SIZE = 1 * 1024 * 1024     # entries smaller than this skip the ra
 _VT_BASE = "https://www.virustotal.com/api/v3"
 _VT_SIMPLE_UPLOAD_MAX = 32 * 1024 * 1024   # larger files need an upload URL
 
-# Zip members worth a VirusTotal scan, by extension or magic bytes (so a
-# renamed executable is still caught). Inert assets are never uploaded.
+# Zip members worth a VirusTotal scan, by extension or magic bytes (a renamed
+# executable is still caught). Inert assets are never uploaded.
 _CODE_EXTENSIONS = {
     ".dll", ".exe", ".so", ".dylib", ".netmodule",
     ".bat", ".cmd", ".com", ".scr", ".msi", ".jar",
@@ -252,10 +252,8 @@ def _url_owned_by(url, author, repo):
 
 
 def validate_structure(m, check_urls=True):
-    """Error strings for every schema rule m breaks (empty when valid).
-
-    check_urls=False skips the https and ownership rules, for manifests
-    written for another host (e.g. a local test repository)."""
+    """Error strings for every schema rule m breaks. check_urls=False skips the
+    https and ownership rules, for a manifest written for another host."""
     if not isinstance(m, dict):
         return ["a manifest must be a JSON object"]
     mv = m.get("manifest_version")
@@ -638,10 +636,9 @@ def vt_scan(path, sha256, api_key):
 
 
 def _vt_scan_path(path, sha, api_key, vt_max_malicious, label, errs, warns, seen=None):
-    """Scan one file, noting the result in warns and a gate failure in errs. A
-    scan that can't run is a note, not a failure. `seen` (sha -> (label, stats))
-    scans each distinct file once per run; a flagged file still fails every
-    label it appears under."""
+    """Scan one file: result in warns, gate failure in errs, a scan that can't
+    run is only a note. `seen` (sha -> (label, stats)) scans each distinct file
+    once; a flagged file still fails every label it appears under."""
     seen = {} if seen is None else seen
     if sha in seen:
         first, stats = seen[sha]
@@ -717,9 +714,7 @@ def _submission_files(paths):
 
 
 def inspect_zip_bundle(path):
-    """Errors in a downloaded zip artifact: unsafe members, size caps, and no
-    .dll at the root (one only in subfolders is almost always a packaging
-    mistake)."""
+    """Errors in a zip artifact: unsafe members, size caps, no root .dll."""
     errs = []
     try:
         zf = zipfile.ZipFile(path)
@@ -825,6 +820,9 @@ def cmd_validate(args):
 
         errs = validate_structure(m)
         warns = []
+        if not errs and m["version"] in known.get(m["id"], {}):
+            errs = [f"{m['id']} {m['version']} is already published and a published "
+                    f"version never changes; bump the version instead"]
         if not errs:
             errs, warns = validate_dependency_targets(m, known)
         if not errs:
@@ -928,10 +926,13 @@ def _ingest_submissions(root):
             raise ValidationError(
                 f"{os.path.relpath(path, root)} is not structurally valid:\n  - "
                 + "\n  - ".join(errs))
-        for art in m["artifacts"]:
-            art["package"] = _sniff_package_from_url(art["download_url"])
         author, repo = parse_id(m["id"])
         dest = os.path.join(root, "manifests", author, repo, f'{m["version"]}.json')
+        if os.path.exists(dest):
+            raise ValidationError(f"{os.path.relpath(path, root)} would overwrite "
+                                  f"{os.path.relpath(dest, root)}, which is published")
+        for art in m["artifacts"]:
+            art["package"] = _sniff_package_from_url(art["download_url"])
         _write_json(dest, ordered_manifest(m))
         moved.append(path)
         print(f"ingested {os.path.relpath(path, root)} -> {os.path.relpath(dest, root)}")
@@ -996,10 +997,9 @@ def cmd_build(args):
 # -- site ----------------------------------------------------------------------
 
 def _screenshot_ok(url, author, repo):
-    """None if url may go on the page, else why not. It must be https on
-    GitHub under the mod's own repo (no third-party host sees visitors), at an
-    immutable address (a release asset, or raw at a commit sha, so what was
-    reviewed can't be swapped), and a raster image (no SVG script)."""
+    """None if url may go on the page, else why not: GitHub under the mod's own
+    repo (no third-party host sees visitors), immutable (a release asset or a
+    commit-pinned raw URL, so a reviewed image can't be swapped), raster only."""
     if not isinstance(url, str) or not _is_https_url(url):
         return "must be an https:// URL"
     p = urlparse(url)
@@ -1071,7 +1071,7 @@ def cmd_site(args):
         f.write(template.replace(SITE_MARKER, data))
 
     shots = sum(len(r["screenshots"]) for r in rows)
-    print(f"wrote {os.path.relpath(out_path, root)}: {len(rows)} mod(s), {shots} screenshot(s)")
+    print(f"wrote {out_path}: {len(rows)} mod(s), {shots} screenshot(s)")
     return 0
 
 
@@ -1087,7 +1087,7 @@ def main(argv=None):
     f.add_argument("paths", nargs="*", help="manifest files or dirs (default: submissions/)")
     f.set_defaults(func=cmd_fill)
 
-    v = sub.add_parser("validate", help="Layer-1 validation of submission manifests")
+    v = sub.add_parser("validate", help="check submission manifests")
     v.add_argument("paths", nargs="*", help="manifest files or dirs (default: submissions/)")
     v.add_argument("--vt-max-malicious", type=int, default=None,
                    help="fail if VirusTotal malicious count exceeds this (default: report only)")

@@ -1,3 +1,2 @@
-# Normalize line endings: text files are LF in the repo regardless of OS, so the
-# Python tooling and YAML workflows check out identically on Linux CI runners.
+# LF everywhere, so files check out identically on the Linux runners.
 * text=auto eol=lf

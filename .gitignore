@@ -1,12 +1,5 @@
-# Python tooling artifacts
 __pycache__/
 *.py[cod]
-*.egg-info/
-.pytest_cache/
-
-# Generated page (built by `modindex.py site`, deployed straight to Pages)
 site/
-
-# OS cruft
 .DS_Store
 Thumbs.db
