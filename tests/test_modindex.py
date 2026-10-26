@@ -28,7 +28,7 @@ ARTIFACT_ORDER = ["targets", "download_url", "sha256", "package", "library_depen
 LIBRARY_ORDER = ["name", "download_url", "sha256", "filename"]
 
 
-def artifact(owner="Owner", repo="Repo", version="1.0.0", targets=("pc", "server"),
+def artifact(owner="Owner", repo="Repo", version="1.0.0", targets=("client_windows", "server"),
              asset=None, **over):
     a = {"targets": list(targets),
          "download_url": (f"https://github.com/{owner}/{repo}/releases/download/"
@@ -45,7 +45,7 @@ def library(name="ExampleLib", sha="b" * 64, **over):
     return lib
 
 
-def manifest(mod_id="Owner.Repo", version="1.0.0", targets=("pc", "server"),
+def manifest(mod_id="Owner.Repo", version="1.0.0", targets=("client_windows", "server"),
              artifacts=None, **over):
     author, repo = (mod_id.split(".", 1) + ["Repo"])[:2]
     d = {"manifest_version": 2, "id": mod_id, "name": repo, "version": version,
@@ -140,14 +140,14 @@ class Structure(unittest.TestCase):
         cases = {
             "one build for pc and server": manifest(),
             "split builds": manifest(artifacts=[
-                artifact(targets=["pc"], asset="Repo-pc.dll"),
+                artifact(targets=["client_windows"], asset="Repo-pc.dll"),
                 artifact(targets=["server"], asset="Repo-server.zip")]),
-            "pc only": manifest(targets=["pc"]),
+            "pc only": manifest(targets=["client_windows"]),
             "server only": manifest(targets=["server"]),
-            "quest only": manifest(targets=["quest"]),
+            "android only": manifest(targets=["client_android"]),
             "all three across two builds": manifest(artifacts=[
-                artifact(targets=["pc", "server"]),
-                artifact(targets=["quest"], asset="Repo-quest.zip")]),
+                artifact(targets=["client_windows", "server"]),
+                artifact(targets=["client_android"], asset="Repo-android.zip")]),
             "package set by the tooling": with_artifact(manifest(), package="zip"),
             "unowned library": with_artifact(manifest(), library_dependencies=[library()]),
             "dependencies": manifest(dependencies={"Other.Kit": "1.2.0", "Third.Party": "2.0.1"}),
@@ -155,7 +155,7 @@ class Structure(unittest.TestCase):
         }
         for scenes in (["normal"], ["quest", "tutorial"], ["tutorial"]):
             cases[f"scenes {scenes}"] = manifest(scenes=scenes)
-        for targets in (["pc"], ["server"], ["quest"], ["pc", "server"]):
+        for targets in (["client_windows"], ["server"], ["client_android"], ["client_windows", "server"]):
             cases[f"parity false, {targets}"] = manifest(targets=targets, parity_required=False)
         for label, m in cases.items():
             with self.subTest(label):
@@ -208,14 +208,14 @@ class Structure(unittest.TestCase):
                                      "name is required"),
             "library file url": (with_artifact(m, library_dependencies=[
                 library(download_url="file:///etc/passwd")]), "https://"),
-            "target twice in one artifact": (manifest(targets=["pc", "pc"]), "it already lists"),
+            "target twice in one artifact": (manifest(targets=["client_windows", "client_windows"]), "it already lists"),
         }
         for bad in ([], {}, "Repo.dll"):
             cases[f"artifacts {bad!r}"] = (manifest(artifacts=bad), "artifacts must be a non-empty list")
-        for bad in ([], None, "pc"):
+        for bad in ([], None, "client_windows"):
             cases[f"targets {bad!r}"] = (with_artifact(m, targets=bad), "artifacts[0].targets")
         for bad in ("android", "PC", "client", "", 1):
-            cases[f"target {bad!r}"] = (manifest(targets=["pc", bad]), "isn't a known target")
+            cases[f"target {bad!r}"] = (manifest(targets=["client_windows", bad]), "isn't a known target")
         # ':' is a drive letter or an NTFS alternate data stream
         for bad in ("sub/y.dll", "C:ExampleLib.dll", "ExampleLib.dll:payload"):
             cases[f"library filename {bad}"] = (with_artifact(m, library_dependencies=[
@@ -240,10 +240,10 @@ class Structure(unittest.TestCase):
                 self.assertIn("artifacts", errs[0])
 
     def test_errors_name_their_artifact(self):
-        split = manifest(artifacts=[artifact(targets=["pc"], asset="Repo-pc.dll"),
+        split = manifest(artifacts=[artifact(targets=["client_windows"], asset="Repo-pc.dll"),
                                     artifact(targets=["server"], asset="Repo-server.zip")])
         self.assertEqual(mi.validate_structure(manifest(artifacts=[
-            artifact(targets=["pc", "server"]),
+            artifact(targets=["client_windows", "server"]),
             artifact(targets=["server"], asset="Repo-server.zip")])),
             ["artifacts[1].targets lists 'server', which artifacts[0] already lists; "
              "each target can have only one build"])
@@ -287,8 +287,8 @@ class Structure(unittest.TestCase):
         self.assertEqual(mi._sniff_package(b""), "dll")
 
     def test_manifest_targets_is_the_sorted_union(self):
-        m = manifest(artifacts=[artifact(targets=["server"]), artifact(targets=["quest", "pc"])])
-        self.assertEqual(mi.manifest_targets(m), ["pc", "quest", "server"])
+        m = manifest(artifacts=[artifact(targets=["server"]), artifact(targets=["client_android", "client_windows"])])
+        self.assertEqual(mi.manifest_targets(m), ["client_android", "client_windows", "server"])
 
 
 class CanonicalOrder(unittest.TestCase):
@@ -430,7 +430,7 @@ class Validate(unittest.TestCase):
 
     def split(self, server_zip):
         return manifest(artifacts=[
-            self.serve(artifact(targets=["pc"], asset="Repo-pc.dll"), b"MZ pc"),
+            self.serve(artifact(targets=["client_windows"], asset="Repo-pc.dll"), b"MZ pc"),
             self.serve(artifact(targets=["server"], asset="Repo-server.zip"), zip_bytes(server_zip))])
 
     def test_every_artifact_is_downloaded_and_verified(self):
@@ -466,7 +466,7 @@ class Validate(unittest.TestCase):
     def test_each_distinct_file_is_scanned_once(self):
         lib_bytes, same = b"MZ shared library", b"MZ identical build"
         lib = self.serve(library(), lib_bytes)
-        arts = [self.serve(artifact(targets=["pc"], asset="Repo-pc.dll"), same),
+        arts = [self.serve(artifact(targets=["client_windows"], asset="Repo-pc.dll"), same),
                 self.serve(artifact(targets=["server"], asset="Repo-server.dll"), same)]
         for a in arts:
             a["library_dependencies"] = [dict(lib)]
@@ -590,7 +590,7 @@ class Build(unittest.TestCase):
 
     def test_ingest_writes_manifests_pointers_and_a_slim_index(self):
         self.submit(scrambled(manifest(scenes=["quest"], artifacts=[
-            artifact(targets=["pc"], asset="Repo-pc.dll", library_dependencies=[library()]),
+            artifact(targets=["client_windows"], asset="Repo-pc.dll", library_dependencies=[library()]),
             artifact(targets=["server"], asset="Repo-server.zip")])))
         self.build()
         base = ("manifests", "Owner", "Repo")
@@ -604,17 +604,17 @@ class Build(unittest.TestCase):
         self.assertEqual(index["index_version"], 2)
         entry = index["mods"]["Owner.Repo"]["1"]
         self.assertEqual((entry["versions"], entry["name"], entry["targets"]),
-                         (["1.0.0"], "Repo", ["pc", "server"]))
+                         (["1.0.0"], "Repo", ["client_windows", "server"]))
         for absent in ("download_url", "sha256", "artifacts", "dependencies", "version"):
             self.assertNotIn(absent, entry)
         self.assertFalse(os.path.exists(os.path.join(self.root, "submissions", "Owner.Repo")))
 
     def test_highest_per_major(self):
-        self.submit(manifest(version="1.0.0", targets=["pc"]))
+        self.submit(manifest(version="1.0.0", targets=["client_windows"]))
         self.submit(manifest(version="1.2.0", artifacts=[
             artifact(version="1.2.0", targets=["server"], asset="Repo-server.dll"),
-            artifact(version="1.2.0", targets=["pc"], asset="Repo-pc.dll")]))
-        self.submit(manifest(version="2.0.0", targets=["quest"]))
+            artifact(version="1.2.0", targets=["client_windows"], asset="Repo-pc.dll")]))
+        self.submit(manifest(version="2.0.0", targets=["client_android"]))
         self.build()
         base = ("manifests", "Owner", "Repo")
         self.assertEqual(self.read(*base, "latest.json")["version"], "2.0.0")
@@ -623,8 +623,8 @@ class Build(unittest.TestCase):
         mods = self.read("repository.json")["mods"]["Owner.Repo"]
         self.assertEqual(list(mods), ["1", "2"])
         self.assertEqual(mods["1"]["versions"], ["1.0.0", "1.2.0"])
-        self.assertEqual(mods["1"]["targets"], ["pc", "server"])
-        self.assertEqual(mods["2"]["targets"], ["quest"])
+        self.assertEqual(mods["1"]["targets"], ["client_windows", "server"])
+        self.assertEqual(mods["2"]["targets"], ["client_android"])
 
     def test_empty_repo_gets_an_empty_index_and_rebuilds_are_idempotent(self):
         self.build()
@@ -661,7 +661,7 @@ class Build(unittest.TestCase):
                          "published")
 
     def test_dependency_targets_are_enforced_repo_wide(self):
-        self.place(manifest("Dev.UIKit", targets=["pc"]))
+        self.place(manifest("Dev.UIKit", targets=["client_windows"]))
         self.place(manifest("Dev.Dual", dependencies={"Dev.UIKit": "1.0.0"}))
         self.build(ingest=False)        # a pc-only dependency of a pc+server mod is fine
         self.place(manifest("Dev.Srv", targets=["server"], dependencies={"Dev.UIKit": "1.0.0"}))
@@ -687,7 +687,7 @@ class Build(unittest.TestCase):
             tmpl = json.load(f)
         self.assertEqual(mi.validate_structure(tmpl),
                          ["artifacts[0].sha256 must be 64 lowercase hex characters"])
-        self.assertEqual(tmpl["artifacts"][0]["targets"], ["pc", "server"])
+        self.assertEqual(tmpl["artifacts"][0]["targets"], ["client_windows", "server"])
 
 
 class Site(unittest.TestCase):
@@ -741,7 +741,7 @@ class FillHashes(unittest.TestCase):
 
     def test_fill_writes_every_artifact_and_library_hash(self):
         rc, out = self.fill(manifest(artifacts=[
-            artifact(targets=["pc"], asset="Repo-pc.dll", sha256="P",
+            artifact(targets=["client_windows"], asset="Repo-pc.dll", sha256="P",
                      library_dependencies=[library("A", sha="P")]),
             artifact(targets=["server"], asset="Repo-server.zip", sha256="P",
                      library_dependencies=[library("B", sha="P")])]))
@@ -764,16 +764,16 @@ class DependencyTargets(unittest.TestCase):
             index.setdefault(k["id"], {})[k["version"]] = k
         return mi.validate_dependency_targets(m, index)
 
-    def mod(self, targets=("pc", "server"), artifacts=None, minimum="1.0.0"):
+    def mod(self, targets=("client_windows", "server"), artifacts=None, minimum="1.0.0"):
         return manifest("Dev.Mod", targets=targets, artifacts=artifacts,
                         dependencies={"Dev.Kit": minimum})
 
     def test_partial_overlap_is_a_note(self):
         split = [artifact("Dev", "Mod", targets=["server"]),
-                 artifact("Dev", "Mod", targets=["pc", "quest"])]
-        cases = ((self.mod(), ["pc"], "server build will load without it"),
-                 (self.mod(), ["server"], "pc build"),
-                 (self.mod(artifacts=split), ["pc"], "quest+server builds will load without it"))
+                 artifact("Dev", "Mod", targets=["client_windows", "client_android"])]
+        cases = ((self.mod(), ["client_windows"], "server build will load without it"),
+                 (self.mod(), ["server"], "client_windows build"),
+                 (self.mod(artifacts=split), ["client_windows"], "client_android+server builds will load without it"))
         for mod, theirs, needle in cases:
             with self.subTest(needle):
                 errs, warns = self.check(mod, manifest("Dev.Kit", targets=theirs))
@@ -783,12 +783,12 @@ class DependencyTargets(unittest.TestCase):
 
     def test_covering_targets_are_silent(self):
         self.assertEqual(self.check(self.mod(), manifest("Dev.Kit")), ([], []))
-        self.assertEqual(self.check(self.mod(["pc"]),
-                                    manifest("Dev.Kit", targets=["pc", "server", "quest"])), ([], []))
+        self.assertEqual(self.check(self.mod(["client_windows"]),
+                                    manifest("Dev.Kit", targets=["client_windows", "server", "client_android"])), ([], []))
 
     def test_no_shared_target_is_rejected(self):
-        for mine, theirs in ((["server"], ["pc"]), (["pc"], ["server"]),
-                             (["quest"], ["pc", "server"]), (["pc", "server"], ["quest"])):
+        for mine, theirs in ((["server"], ["client_windows"]), (["client_windows"], ["server"]),
+                             (["client_android"], ["client_windows", "server"]), (["client_windows", "server"], ["client_android"])):
             with self.subTest(mine=mine, theirs=theirs):
                 errs, _ = self.check(self.mod(mine), manifest("Dev.Kit", targets=theirs))
                 self.assertEqual(len(errs), 1)
@@ -797,7 +797,7 @@ class DependencyTargets(unittest.TestCase):
     def test_judges_the_version_an_install_would_pick(self):
         mod = self.mod(["server"], minimum="1.1.0")
         # the highest release in the minimum's major wins
-        self.assertEqual(self.check(mod, manifest("Dev.Kit", "1.1.0", targets=["pc"]),
+        self.assertEqual(self.check(mod, manifest("Dev.Kit", "1.1.0", targets=["client_windows"]),
                                     manifest("Dev.Kit", "1.5.0")), ([], []))
         # another major, or a release below the minimum, isn't consulted, and an
         # unknown dependency is only a note
@@ -846,7 +846,7 @@ class ReferenceFixtures(unittest.TestCase):
             mi._write_json(os.path.join(root, "manifests", author, repo,
                                         f"{m['version']}.json"), m)
         _, out = run_quiet(mi.cmd_build, repo=root, ingest=False, prune=False)
-        self.assertIn("ExampleDev.PcHelper 1.0.0 has builds for pc only", out)
+        self.assertIn("ExampleDev.PcHelper 1.0.0 has builds for client_windows only", out)
         with open(os.path.join(root, "repository.json"), encoding="utf-8") as f:
             built = json.load(f)
         with open(os.path.join(FIXTURES, "repository.json"), encoding="utf-8") as f:
