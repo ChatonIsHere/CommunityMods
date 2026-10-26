@@ -1,41 +1,16 @@
 #!/usr/bin/env python3
 """
-modindex, the CommunityMods repository's own tooling.
+modindex: validates CommunityMods submissions and compiles the static index.
 
-Validates submitted manifests (Layer 1) and compiles the static index the
-launcher reads. A third-party source doesn't need this tool, only the file
-layout in docs/REPO_STRUCTURE.md.
+  fill-hashes [paths]   write the real sha256 of every artifact and library
+  validate [paths]      check submissions, downloading and hashing every file
+                        (VirusTotal too when VIRUSTOTAL_API_KEY is set)
+  build                 compile manifests/ into latest*.json and repository.json
+                        (--ingest moves submissions in first, --prune deletes them)
+  site                  bake tools/page.html with the mod list into site/index.html
 
-Stdlib only, no pip install, so it runs in CI and in any fork with bare Python.
-
-Subcommands
------------
-  fill-hashes [paths]   Download the files a manifest points at and write their
-                        real sha256 in (every artifact and every library).
-                        Defaults to every submissions/**/*.json.
-
-  validate [paths...]   Layer-1 validation of submission manifest(s). Checks
-                        schema, id/ownership, filename safety, version format,
-                        targets, and downloads + hashes every file. Runs a
-                        VirusTotal scan when VIRUSTOTAL_API_KEY is set (gate
-                        with --vt-max-malicious). Defaults to every
-                        submissions/**/*.json. Exits non-zero on failure.
-
-  build [--ingest]      Compile the index. Reads every manifests/**/<version>.json,
-        [--prune]       regenerates each mod's latest.json / latest.<major>.json
-                        pointers, and rebuilds repository.json. With --ingest,
-                        first validates and moves submissions/**/*.json into
-                        manifests/<author>/<repo>/<version>.json; --prune then
-                        deletes the moved submission files.
-
-  site [--out DIR]      Bake the browsable page: tools/page.html with the mod
-                        list injected, written to site/index.html. Runs after
-                        build, in its own workflow, so the page only ever
-                        describes an index that compiled.
-
-Keep these rules in sync with the two parsers that read what this repo
-publishes -- the launcher's (TavernLauncher/tavern_shared/mods/manifest.py) and
-TavernLib's (Backend/Mods/ModDataModel.cs) -- and docs/REPO_STRUCTURE.md.
+paths default to submissions/. Rules: docs/REPO_STRUCTURE.md, which the
+launcher and TavernLib implement too; change them together.
 """
 
 import argparse
@@ -54,26 +29,18 @@ import uuid
 import zipfile
 from urllib.parse import urlparse
 
-# Schema majors this tool speaks, kept in sync with the launcher's parser.
-# The manifest and index schemas version independently.
-SUPPORTED_MANIFEST_MAJOR = 2     # modmanager.SUPPORTED_MANIFEST_MAJOR
-SUPPORTED_INDEX_MAJOR = 2        # modmanager.SUPPORTED_INDEX_MAJOR
-
-# The kinds of process an artifact can be built for (docs/REPO_STRUCTURE.md,
-# "Targets"). The launcher and TavernLib ignore names they don't know, so a
-# target added later doesn't break them; this validator is what rejects one.
+SUPPORTED_MANIFEST_MAJOR = 2
+SUPPORTED_INDEX_MAJOR = 2
 TARGETS = ("pc", "server", "quest")
+SCENES = ("normal", "quest", "tutorial")
+_PACKAGE_TYPES = ("dll", "zip")
 
-# GitHub's own identifier rules, so an id can never name a repo/user that can't
-# exist (and the derived on-disk path is therefore always safe).
 GITHUB_USER_RE = re.compile(r"^[A-Za-z0-9](?:-?[A-Za-z0-9]){0,38}$")
 GITHUB_REPO_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-VERSION_SEGMENT_MAX = 2147483647   # each version segment has to fit an Int32 (TavernLib)
+VERSION_SEGMENT_MAX = 2147483647   # TavernLib parses segments as Int32
 
-# Canonical field order for anything we (re)write, so generated files diff
-# cleanly against hand-written ones and against each other.
 _MANIFEST_ORDER = [
     "manifest_version", "id", "name", "version", "author", "description",
     "screenshots", "parity_required", "scenes", "dependencies", "artifacts",
@@ -81,8 +48,6 @@ _MANIFEST_ORDER = [
 _ARTIFACT_ORDER = ["targets", "download_url", "sha256", "package", "library_dependencies"]
 _LIB_ORDER = ["name", "download_url", "sha256", "filename"]
 
-# Top-level fields manifest v1 had that v2 moved into `artifacts` (or, for the
-# two sides, replaced with each artifact's `targets`), each with what to do.
 _V1_FIELDS = {
     "client_side": "replaced by the targets of each entry in artifacts (pc, server, quest)",
     "server_side": "replaced by the targets of each entry in artifacts (pc, server, quest)",
@@ -101,33 +66,92 @@ _V1_MESSAGE = (
     "has one artifact with \"targets\": [\"pc\", \"server\"]. See "
     "submissions/TEMPLATE.json and docs/REPO_STRUCTURE.md.")
 
+# Zip limits; the launcher's extractor applies the same ones at install time.
+ZIP_MAX_ENTRIES = 2000
+ZIP_MAX_TOTAL_UNCOMPRESSED = 500 * 1024 * 1024
+ZIP_MAX_RATIO = 200                      # per entry, uncompressed / compressed
+ZIP_RATIO_MIN_SIZE = 1 * 1024 * 1024     # entries smaller than this skip the ratio check
+
+_VT_BASE = "https://www.virustotal.com/api/v3"
+_VT_SIMPLE_UPLOAD_MAX = 32 * 1024 * 1024   # larger files need an upload URL
+
+# Zip members worth a VirusTotal scan, by extension or magic bytes (so a
+# renamed executable is still caught). Inert assets are never uploaded.
+_CODE_EXTENSIONS = {
+    ".dll", ".exe", ".so", ".dylib", ".netmodule",
+    ".bat", ".cmd", ".com", ".scr", ".msi", ".jar",
+    ".ps1", ".psm1", ".vbs", ".vbe", ".js", ".jse",
+    ".wsf", ".wsh", ".hta", ".py", ".sh",
+}
+_CODE_MAGICS = (
+    b"MZ", b"\x7fELF",                                                    # PE, ELF
+    b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf", b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe",  # Mach-O
+    b"\xca\xfe\xba\xbe",                                                  # Mach-O fat / Java
+    b"#!",
+)
+
+SITE_MARKER = "/*__MODS__*/[]"   # the [] keeps the template a valid page on its own
+SCREENSHOT_EXT_RE = re.compile(r"\.(?:png|jpe?g|webp|gif)$", re.IGNORECASE)
+SCREENSHOT_MAX = 4
+_COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+_NON_SUBMISSION_BASENAMES = {"readme.json", "template.json"}
+
+
+class ValidationError(Exception):
+    """A failure that blocks a submission or a build."""
+
+
+# -- helpers -------------------------------------------------------------------
+
+def repo_root(explicit=None):
+    return os.path.abspath(explicit) if explicit else os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__)))
+
+
+def _load_json(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _write_json(path, obj):
+    # LF on every OS, matching .gitattributes.
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+
+def _vkey(version):
+    return tuple(int(x) for x in version.split("."))
+
+
+def _is_safe_basename(name):
+    # ':' is a drive letter or an NTFS alternate data stream on Windows.
+    return (isinstance(name, str) and name not in ("", ".", "..")
+            and not any(c in name for c in "/\\:") and os.path.basename(name) == name)
+
+
+def parse_id(mod_id):
+    """'<github-user>.<github-repo>' -> (author, repo), or ValidationError."""
+    if not isinstance(mod_id, str) or "." not in mod_id:
+        raise ValidationError(f"id {mod_id!r} must be '<user>.<repo>'")
+    author, repo = mod_id.split(".", 1)
+    if not GITHUB_USER_RE.match(author):
+        raise ValidationError(f"id author segment {author!r} is not a valid GitHub username")
+    if not GITHUB_REPO_RE.match(repo):
+        raise ValidationError(f"id repo segment {repo!r} is not a valid GitHub repo name")
+    if repo in (".", ".."):
+        raise ValidationError(f"id segment {repo!r} is path-unsafe")
+    return author, repo
+
 
 def parity_required(m, default=True):
-    """Whether a client joining a server that runs this mod must match its exact
-    version, read off a manifest or an index entry.
-
-    True (the default) for mods where both halves are one system and a mismatch
-    breaks the session outright - a voice codec, a network protocol, anything
-    where the two sides exchange data they both have to understand. False for
-    mods whose halves work independently, where the server won't block a join
-    and the client is offered the mod rather than obliged to have it.
-
-    Only a literal false relaxes it. A missing key, a null, or a string "false"
-    all read as required, so neither an older manifest nor a malformed one from
-    an unreviewed source can quietly drop a guarantee the server depends on."""
+    # Only a literal false relaxes it, so malformed data fails closed.
     return m.get("parity_required", default) is not False
 
 
-# The scenes a server can run, by the names a manifest's optional `scenes` lists.
-SCENES = ("normal", "quest", "tutorial")
-
-
 def scenes_error(m):
-    """What's wrong with a manifest's `scenes`, or None when it's fine. Absent
-    or null means every scene. Present, it must be a non-empty list of distinct
-    names from SCENES: the launcher and TavernLib keep names they don't know
-    (so a scene added later doesn't break older builds), which makes this the
-    one place a misspelt scene gets caught before it quietly matches nothing."""
     value = m.get("scenes")
     if value is None:
         return None
@@ -143,116 +167,19 @@ def scenes_error(m):
         return "scenes lists every scene; leave it out instead, which means the same"
     return None
 
-# An artifact's download_url is a single assembly ("dll") or an archive extracted
-# into its target folder, Mods/<id>/.<target>/ ("zip"). Set by the
-# tooling from the file's own bytes during validation/ingest (see
-# _sniff_package), never written by submitters.
-_PACKAGE_TYPES = ("dll", "zip")
-
 
 def _sniff_package(head):
-    """dll vs zip from a file's leading bytes: a zip starts with 'PK', a .NET
-    assembly (or anything else) does not. Unambiguous for the two supported types."""
     return "zip" if head[:2] == b"PK" else "dll"
-
-# Zip-bundle safety limits, enforced when the archive is downloaded during
-# validation. Sized to allow a real mod's Unity asset bundles while still
-# rejecting a decompression bomb. The launcher's extractor
-# (modmanager._safe_extract_zip) applies the same limits at install time, for
-# third-party sources that skip this validator.
-ZIP_MAX_ENTRIES = 2000
-ZIP_MAX_TOTAL_UNCOMPRESSED = 500 * 1024 * 1024   # 500 MB extracted, summed
-ZIP_MAX_RATIO = 200                              # per-entry uncompressed/compressed
-ZIP_RATIO_MIN_SIZE = 1 * 1024 * 1024             # ignore the ratio below this size
-
-_VT_BASE = "https://www.virustotal.com/api/v3"
-_VT_SIMPLE_UPLOAD_MAX = 32 * 1024 * 1024   # files larger than this need an upload URL
-
-# Which members of a zip bundle get VirusTotal-scanned. Only code-bearing files
-# are scanned individually rather than the whole archive, since a bulky mod is
-# mostly inert assets (3D models, textures, audio, Unity asset bundles) and a
-# whole-archive upload could exceed VT's size limit. A member counts as
-# code-bearing by extension or by leading magic bytes, so a renamed executable
-# is still caught.
-_CODE_EXTENSIONS = {
-    ".dll", ".exe", ".so", ".dylib", ".netmodule",           # managed / native
-    ".bat", ".cmd", ".com", ".scr", ".msi", ".jar",          # binaries / installers
-    ".ps1", ".psm1", ".vbs", ".vbe", ".js", ".jse",          # scripts
-    ".wsf", ".wsh", ".hta", ".py", ".sh",
-}
-_CODE_MAGICS = (
-    b"MZ",                 # PE (Windows .dll/.exe)
-    b"\x7fELF",            # ELF (Linux)
-    b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf",   # Mach-O 32/64
-    b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe",   # Mach-O byte-swapped
-    b"\xca\xfe\xba\xbe",   # Mach-O fat / Java .class
-    b"#!",                 # shebang script
-)
-
-
-class ValidationError(Exception):
-    """A hard failure that must block a submission or a build."""
-
-
-# -- small helpers -----------------------------------------------------------
-
-def repo_root(explicit=None):
-    if explicit:
-        return os.path.abspath(explicit)
-    # tools/modindex.py -> repo root is the parent of tools/
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-def _load_json(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _is_safe_basename(name):
-    """A bare filename: no directory part, not '.'/'..'/empty, no separators,
-    no colon. The colon matters on the launcher's platform specifically: it is
-    the drive separator, and on NTFS the alternate-data-stream separator, so
-    "mod.dll:payload" names a hidden stream rather than a file. Mirrors
-    modmanager's _safe_basename / TavernLib's SafeBasename."""
-    return (
-        isinstance(name, str)
-        and name not in ("", ".", "..")
-        and "/" not in name
-        and "\\" not in name
-        and ":" not in name
-        and os.path.basename(name) == name
-    )
-
-
-def parse_id(mod_id):
-    """id is '<github-user>.<github-repo>'. The author is everything before the
-    first dot (GitHub usernames can't contain one); the repo is the rest.
-    Returns (author, repo) or raises ValidationError."""
-    if not isinstance(mod_id, str) or "." not in mod_id:
-        raise ValidationError(f"id {mod_id!r} must be '<user>.<repo>'")
-    author, repo = mod_id.split(".", 1)
-    if not GITHUB_USER_RE.match(author):
-        raise ValidationError(f"id author segment {author!r} is not a valid GitHub username")
-    if not GITHUB_REPO_RE.match(repo):
-        raise ValidationError(f"id repo segment {repo!r} is not a valid GitHub repo name")
-    for seg in (author, repo):
-        if seg in (".", "..") or "/" in seg or "\\" in seg:
-            raise ValidationError(f"id segment {seg!r} is path-unsafe")
-    return author, repo
 
 
 def _ordered(d, order):
     out = {k: d[k] for k in order if k in d}
-    # keep any unknown keys rather than silently dropping them
-    for k, v in d.items():
-        if k not in out:
-            out[k] = v
+    out.update((k, v) for k, v in d.items() if k not in out)   # unknown keys last
     return out
 
 
 def ordered_manifest(m):
-    """m with its keys in the spec's canonical order, all the way down:
-    manifest, then each artifact, then each artifact's libraries."""
+    """m with its keys in the spec's order at every level."""
     out = _ordered(m, _MANIFEST_ORDER)
     if isinstance(out.get("artifacts"), list):
         arts = []
@@ -269,9 +196,7 @@ def ordered_manifest(m):
 
 
 def manifest_targets(m):
-    """The sorted union of the known targets across a manifest's artifacts:
-    every kind of process the release has a build for. Tolerant of a malformed
-    manifest (it reads what it can), since validate_structure owns reporting."""
+    """Sorted union of the known targets across m's artifacts."""
     found = set()
     for a in m.get("artifacts") or []:
         if isinstance(a, dict) and isinstance(a.get("targets"), list):
@@ -279,44 +204,26 @@ def manifest_targets(m):
     return sorted(found)
 
 
+def _display(m):
+    return {"name": m.get("name", m["id"]),
+            "author": m.get("author", m["id"].split(".", 1)[0]),
+            "description": m.get("description", "")}
+
+
 def summary_entry(highest_manifest, versions_in_major):
-    """The slim repository.json entry for one (id, major): discovery fields taken
-    from the highest release in that major, plus the list of every version in it.
-    No download_url/sha256/dependencies here; those live only in the per-version
-    manifest, so the install-critical data has one home."""
+    """The repository.json entry for one (id, major)."""
     m = highest_manifest
-    entry = {
-        "name": m.get("name", m["id"]),
-        "author": m.get("author", m["id"].split(".", 1)[0]),
-        "description": m.get("description", ""),
-        # Carried in the index too, so a launcher can tell a required mod from a
-        # recommended one while browsing, without fetching every manifest.
-        "parity_required": parity_required(m),
-        # Same reason: which processes it has a build for, so the browse list
-        # can filter by target without a manifest fetch per mod.
-        "targets": manifest_targets(m),
-    }
-    # Same reason, only when the release names any: absent means every scene.
+    entry = {**_display(m), "parity_required": parity_required(m),
+             "targets": manifest_targets(m)}
     if m.get("scenes") is not None:
         entry["scenes"] = list(m["scenes"])
     entry["versions"] = versions_in_major
     return entry
 
 
-def _write_json(path, obj):
-    # newline="\n" forces LF regardless of OS, so these generated files don't get
-    # rewritten with CRLF on Windows and dirty the diff against the repo's LF
-    # convention (.gitattributes eol=lf).
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(obj, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-
-
-# -- structural validation (no network) --------------------------------------
+# -- structural validation (no network) ---------------------------------------
 
 def _version_error(value, what):
-    """Why `value` isn't a usable MAJOR.MINOR.PATCH, or None."""
     if not isinstance(value, str) or not VERSION_RE.match(value):
         return f"{what} {value!r} must be exactly MAJOR.MINOR.PATCH (three integers)"
     if any(int(seg) > VERSION_SEGMENT_MAX for seg in value.split(".")):
@@ -324,25 +231,37 @@ def _version_error(value, what):
     return None
 
 
-def validate_structure(m, check_urls=True):
-    """Every mechanical rule from docs/REPO_STRUCTURE.md's "Manifest" section.
-    Returns a list of error strings (empty == structurally valid). Does not
-    touch the network.
+def _is_https_url(url):
+    try:
+        p = urlparse(url)
+    except Exception:
+        return False
+    return p.scheme == "https" and bool(p.hostname)
 
-    check_urls=False sets aside the two rules about WHERE files live (https,
-    and this repo's ownership rule for each artifact's download_url), keeping
-    every rule about the manifest's shape. Only for checking a manifest
-    written for some other host, like a local test repository; every real
-    submission and build goes through with them on."""
+
+def _url_owned_by(url, author, repo):
+    """url is a github.com URL under author/repo (case-insensitive, like GitHub)."""
+    try:
+        p = urlparse(url)
+    except Exception:
+        return False
+    if p.scheme != "https" or p.netloc.lower() != "github.com":
+        return False
+    parts = [seg for seg in p.path.split("/") if seg]
+    return len(parts) >= 2 and parts[0].lower() == author.lower() and parts[1].lower() == repo.lower()
+
+
+def validate_structure(m, check_urls=True):
+    """Error strings for every schema rule m breaks (empty when valid).
+
+    check_urls=False skips the https and ownership rules, for manifests
+    written for another host (e.g. a local test repository)."""
     if not isinstance(m, dict):
         return ["a manifest must be a JSON object"]
-    errs = []
-
     mv = m.get("manifest_version")
     if type(mv) is int and mv == 1:
-        # Nothing else is worth reporting on a v1 manifest: every field-level
-        # error would just be a symptom of this one.
-        return [_V1_MESSAGE]
+        return [_V1_MESSAGE]     # every other error would be a symptom of this one
+    errs = []
     if type(mv) is not int or mv != SUPPORTED_MANIFEST_MAJOR:
         errs.append(f"manifest_version must be {SUPPORTED_MANIFEST_MAJOR}, got {mv!r}")
 
@@ -362,31 +281,20 @@ def validate_structure(m, check_urls=True):
             errs.append(f"top-level {key} isn't part of manifest v2: it's {what}")
 
     if "parity_required" not in m:
-        # Mandatory rather than defaulted, so publishing a mod is a deliberate
-        # answer to "must a joining client match this exactly?" rather than
-        # something inherited by omission. No reader defaults it either: every
-        # shape it travels in is written by tooling that knows about it, so a
-        # missing one is malformed data and is rejected rather than guessed at.
         errs.append("parity_required is required: true if a client joining a "
                     "server that runs this mod must have this exact version, "
                     "false if the server should not block the join over it")
     elif not isinstance(m["parity_required"], bool):
         errs.append("parity_required must be a boolean")
 
-    scenes_problem = scenes_error(m)
-    if scenes_problem:
-        errs.append(scenes_problem)
+    problem = scenes_error(m)
+    if problem:
+        errs.append(problem)
 
     deps = m.get("dependencies")
     if not isinstance(deps, dict):
         errs.append("dependencies must be an object, always present (use {} when none)")
     else:
-        # Both halves of every entry, and the container. A dependency id
-        # is fed straight into the launcher's by-id manifest fetch and its
-        # value into major-lock resolution, so a malformed one here is not
-        # caught until an installing user hits an unresolvable error with no
-        # idea which manifest is at fault. Same rules the mod's own id and
-        # version answer to.
         for dep_id, min_version in deps.items():
             try:
                 parse_id(dep_id)
@@ -411,9 +319,6 @@ def validate_structure(m, check_urls=True):
 
 
 def _artifact_errors(a, i, claimed, author, repo, check_urls):
-    """The rules for one entry of `artifacts`. `claimed` maps each target seen
-    so far to the artifact that listed it, so a target can only be served by
-    one build."""
     where = f"artifacts[{i}]"
     if not isinstance(a, dict):
         return [f"{where} must be an object"]
@@ -443,8 +348,6 @@ def _artifact_errors(a, i, claimed, author, repo, check_urls):
     elif check_urls:
         if not _is_https_url(url):
             errs.append(f"{where}.download_url must be an https:// URL")
-        # Ownership: every build of the mod must live under the submitter's
-        # repo. A mod can't ship someone else's binary as itself, for any target.
         elif author and repo and not _url_owned_by(url, author, repo):
             errs.append(
                 f"{where}.download_url {url!r} must be a GitHub release asset "
@@ -454,9 +357,7 @@ def _artifact_errors(a, i, claimed, author, repo, check_urls):
     if not isinstance(a.get("sha256"), str) or not SHA256_RE.match(a["sha256"]):
         errs.append(f"{where}.sha256 must be 64 lowercase hex characters")
 
-    # `package` is tooling-set (ingest sniffs it), so a submission normally
-    # omits it. If a value is present it must still be valid; ingest
-    # overwrites it from the file's bytes regardless.
+    # Normally omitted (ingest sets it), but must be valid if present.
     pkg = a.get("package")
     if pkg is not None and pkg not in _PACKAGE_TYPES:
         errs.append(f"{where}.package {pkg!r} must be one of {_PACKAGE_TYPES} "
@@ -485,52 +386,30 @@ def _artifact_errors(a, i, claimed, author, repo, check_urls):
     return errs
 
 
+# -- dependency targets --------------------------------------------------------
+
 def _targets_text(targets):
     return "+".join(sorted(targets)) if targets else "no target"
 
 
 def _resolve_dep_in_repo(known, dep_id, min_version):
-    """The manifest the LAUNCHER's resolver would pick for this dependency:
-    highest version within min_version's major that is >= min_version. Mirrors
-    modmanager's Minimum-Required-Version-with-Major-Lock so this check reasons
-    about the same file an install would actually land on.
-
-    None if this repo doesn't carry it, which is not an error on its own -- a
-    dependency may legitimately live in another source the submitter's users
-    add themselves."""
+    """The manifest an install would pick: highest in min_version's major that
+    is >= it. None if this repo doesn't carry one."""
     versions = known.get(dep_id) or {}
-    major = min_version.split(".")[0]
-    key = _vkey(min_version)
-    candidates = [v for v in versions
-                  if v.split(".")[0] == major and _vkey(v) >= key]
-    if not candidates:
-        return None
-    return versions[max(candidates, key=_vkey)]
+    major, key = min_version.split(".")[0], _vkey(min_version)
+    candidates = [v for v in versions if v.split(".")[0] == major and _vkey(v) >= key]
+    return versions[max(candidates, key=_vkey)] if candidates else None
 
 
 def validate_dependency_targets(m, known):
-    """The one rule that needs to see OTHER manifests: a dependency has to have
-    a build for at least one target the mod requiring it has. Returns
-    (errs, warns).
-
-    Error only when the two target sets are DISJOINT -- an installer resolves a
-    closure for one target and leaves out a dependency with no build for it,
-    so a dependency sharing no target is left out of every install of this
-    mod. A server-only mod depending on a pc-only mod is the case.
-
-    Deliberately NOT an error when the sets merely differ: a pc+server mod
-    depending on a pc-only mod is the ordinary shape of "my client half needs
-    this", and is exactly what per-target resolution exists to serve. It draws
-    a note instead, because the one thing the tooling cannot check is whether
-    the author *meant* the other builds to run without it -- no manifest states
-    that, and reading it out of the assembly is the only way to know. The note
-    puts that question in front of a human reviewer, which is where it can
-    actually be answered."""
+    """(errs, warns): a dependency sharing no target with m is an error, since
+    per-target installs leave it out everywhere m runs. Partial overlap is only
+    a note: whether m's other builds work without it is for a reviewer."""
     errs, warns = [], []
     mine = set(manifest_targets(m))
     for dep_id, min_version in sorted((m.get("dependencies") or {}).items()):
         if _version_error(min_version, "") is not None:
-            continue        # already reported by validate_structure
+            continue        # validate_structure reports it
         dep = _resolve_dep_in_repo(known, dep_id, min_version)
         if dep is None:
             warns.append(
@@ -560,65 +439,49 @@ def validate_dependency_targets(m, known):
     return errs, warns
 
 
-def _known_manifests(root):
-    """id -> {version: manifest} from manifests/, WITHOUT re-validating each one.
-    _collect_manifests is the build path and is strict on purpose; this is for
-    validating a submission, where another mod's unrelated problem must not fail
-    the PR in front of us."""
-    known = {}
-    man_dir = os.path.join(root, "manifests")
-    for dirpath, _dirs, files in os.walk(man_dir):
+def _manifest_files(root):
+    """Every manifests/**/<version>.json, skipping the latest*.json pointers."""
+    for dirpath, _dirs, files in os.walk(os.path.join(root, "manifests")):
         for name in sorted(files):
-            if not name.endswith(".json") or name.startswith("latest"):
-                continue
-            try:
-                m = _load_json(os.path.join(dirpath, name))
-                known.setdefault(m["id"], {})[m["version"]] = m
-            except Exception:
-                continue
+            if name.endswith(".json") and not name.startswith("latest"):
+                yield os.path.join(dirpath, name)
+
+
+def _known_manifests(root):
+    """id -> {version: manifest}, unvalidated: another mod's problem must not
+    fail an unrelated submission."""
+    known = {}
+    for path in _manifest_files(root):
+        try:
+            m = _load_json(path)
+            known.setdefault(m["id"], {})[m["version"]] = m
+        except Exception:
+            continue
     return known
 
 
-def _url_owned_by(url, author, repo):
-    """True if url is a github.com release asset under <author>/<repo>
-    (case-insensitively, GitHub owner/repo are case-insensitive)."""
-    try:
-        p = urlparse(url)
-    except Exception:
-        return False
-    if p.scheme != "https" or p.netloc.lower() != "github.com":
-        return False
-    parts = [seg for seg in p.path.split("/") if seg]
-    return len(parts) >= 2 and parts[0].lower() == author.lower() and parts[1].lower() == repo.lower()
+def _collect_manifests(root):
+    """id -> {version: manifest}, strictly validated, for the build."""
+    mods = {}
+    for path in _manifest_files(root):
+        m = _load_json(path)
+        errs = validate_structure(m)
+        if not errs:   # ingest always sets package, so a missing one was hand-placed
+            errs = [f"artifacts[{i}] has no package (ingest sets it from the file)"
+                    for i, a in enumerate(m["artifacts"]) if "package" not in a]
+        if errs:
+            raise ValidationError(f"{os.path.relpath(path, root)} is invalid:\n  - "
+                                  + "\n  - ".join(errs))
+        mods.setdefault(m["id"], {})[m["version"]] = m
+    return mods
 
 
-def _is_https_url(url):
-    """Pure check: url is a well-formed https:// URL with a host. The block on
-    private/internal addresses happens at fetch time (see _assert_safe_to_fetch),
-    which needs DNS and so can't run in this network-free validation pass."""
-    try:
-        p = urlparse(url)
-    except Exception:
-        return False
-    return p.scheme == "https" and bool(p.hostname)
-
-
-# -- file download + hashing -------------------------------------------------
+# -- downloads -----------------------------------------------------------------
 
 def _assert_safe_to_fetch(url):
-    """Refuse anything but an https:// URL whose host resolves only to public
-    addresses. Blocks file:// reads and SSRF to loopback/private/link-local
-    addresses, since validation runs in a context holding secrets (see
-    .github/workflows/validate.yml). Raises ValidationError if the URL is
-    unsafe.
-
-    Checks the resolution, not the connection, so a host that answers with a
-    public address here and a private one microseconds later (DNS rebinding)
-    is not caught. Closing that needs the socket pinned to the address that was
-    vetted, which urllib gives no hook for. Left as-is deliberately: the payoff
-    is one fetch of an attacker-named URL against a runner that holds only a
-    VirusTotal key, and the gain does not justify hand-rolling the HTTP client
-    this tool exists to avoid needing."""
+    """Refuse non-https URLs and hosts resolving to non-public addresses, since
+    validation runs with secrets. DNS rebinding isn't covered: urllib can't pin
+    the vetted address, and the runner only holds a VirusTotal key."""
     p = urlparse(url)
     if p.scheme != "https":
         raise ValidationError(f"refusing to fetch non-https URL {url!r}")
@@ -637,64 +500,45 @@ def _assert_safe_to_fetch(url):
                 f"non-public address {ip}")
 
 
-def download_and_hash(url):
-    """Streams url to a temp file and returns (temp_path, sha256_hex). Caller
-    deletes the temp file. Streams (not read-all) so a large asset can't blow up
-    memory in CI."""
+def _urlopen(url, timeout):
     _assert_safe_to_fetch(url)
     req = urllib.request.Request(url, headers={"User-Agent": "modindex"})
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def download_and_hash(url):
+    """Stream url to a temp file; return (temp_path, sha256). Caller deletes it."""
     fd, tmp = tempfile.mkstemp(prefix="modindex_", suffix=".bin")
     h = hashlib.sha256()
     try:
-        with urllib.request.urlopen(req, timeout=120) as r, os.fdopen(fd, "wb") as out:
-            while True:
-                chunk = r.read(65536)
-                if not chunk:
-                    break
+        with os.fdopen(fd, "wb") as out, _urlopen(url, 120) as r:
+            while chunk := r.read(65536):
                 h.update(chunk)
                 out.write(chunk)
         return tmp, h.hexdigest()
     except Exception:
-        try:
-            os.close(fd)
-        except Exception:
-            pass
-        if os.path.exists(tmp):
-            os.remove(tmp)
+        os.remove(tmp)
         raise
 
 
 def _sha256_of_url(url):
-    """The sha256 of the file at url, temp file cleaned up. Used by fill-hashes."""
     tmp, digest = download_and_hash(url)
     os.remove(tmp)
     return digest
 
 
 def _sniff_package_from_url(url):
-    """Determines dll vs zip from the first few bytes of the download, without
-    pulling the whole file. Used by ingest to set `package` from the actual
-    file."""
-    _assert_safe_to_fetch(url)
-    req = urllib.request.Request(url, headers={"User-Agent": "modindex"})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        head = r.read(8)
-    return _sniff_package(head)
+    with _urlopen(url, 60) as r:
+        return _sniff_package(r.read(8))
 
 
-# -- VirusTotal (Layer 1, when a key is configured) --------------------------
+# -- VirusTotal ----------------------------------------------------------------
 
-# VirusTotal's free API allows 4 requests/minute. A submission can need many
-# more calls than that (lookup + upload + polling, per file scanned), so calls
-# are paced to stay under the limit:
-#   1. _vt_throttle keeps calls under _VT_MAX_PER_MIN in a rolling 60s window,
-#      sleeping when the window is full.
-#   2. _vt_request retries on HTTP 429, waiting out the window (honouring
-#      Retry-After when present).
-# Raise the cap via the VT_MAX_PER_MINUTE env var for a higher-tier key.
+# The free API allows 4 requests a minute, so calls are paced in a rolling
+# window (VT_MAX_PER_MINUTE raises the cap) and a 429 is waited out and retried.
 _VT_WINDOW_SECONDS = 60
 _VT_MAX_RETRIES = 5
-_vt_request_times = []       # monotonic timestamps of recent VT API calls
+_vt_request_times = []       # monotonic times of recent calls
 
 
 def _vt_max_per_min():
@@ -705,23 +549,19 @@ def _vt_max_per_min():
 
 
 def _vt_throttle():
-    """Block until firing one more VT request stays within the per-minute cap:
-    prune timestamps older than the window, sleep if it's still full, then record
-    this call."""
-    def _prune(now):
-        cutoff = now - _VT_WINDOW_SECONDS
-        while _vt_request_times and _vt_request_times[0] <= cutoff:
+    def prune(now):
+        while _vt_request_times and _vt_request_times[0] <= now - _VT_WINDOW_SECONDS:
             _vt_request_times.pop(0)
 
     now = time.monotonic()
-    _prune(now)
+    prune(now)
     if len(_vt_request_times) >= _vt_max_per_min():
         wait = _vt_request_times[0] + _VT_WINDOW_SECONDS - now + 0.5
         if wait > 0:
             print(f"  ..    VirusTotal rate limit reached; waiting {wait:.0f}s for "
                   f"the next slot", flush=True)
             time.sleep(wait)
-        _prune(time.monotonic())
+        prune(time.monotonic())
     _vt_request_times.append(time.monotonic())
 
 
@@ -736,8 +576,6 @@ def _vt_request(url, api_key, method="GET", data=None, content_type=None):
             with urllib.request.urlopen(req, timeout=120) as r:
                 return json.load(r)
         except urllib.error.HTTPError as e:
-            # Retry only on 429, and only while retries remain. Other errors
-            # propagate to the caller.
             if e.code != 429 or attempt >= _VT_MAX_RETRIES:
                 raise
             try:
@@ -752,10 +590,9 @@ def _vt_request(url, api_key, method="GET", data=None, content_type=None):
 
 
 def vt_lookup(sha256, api_key):
-    """Return last_analysis_stats for a hash VT already knows, or None (404)."""
+    """last_analysis_stats for a known hash, or None."""
     try:
-        j = _vt_request(f"{_VT_BASE}/files/{sha256}", api_key)
-        return j["data"]["attributes"]["last_analysis_stats"]
+        return _vt_request(f"{_VT_BASE}/files/{sha256}", api_key)["data"]["attributes"]["last_analysis_stats"]
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return None
@@ -763,18 +600,16 @@ def vt_lookup(sha256, api_key):
 
 
 def vt_upload(path, api_key):
-    """Upload a file for analysis, return its analysis id."""
-    size = os.path.getsize(path)
+    """Upload a file for analysis; return the analysis id."""
     url = f"{_VT_BASE}/files"
-    if size > _VT_SIMPLE_UPLOAD_MAX:
+    if os.path.getsize(path) > _VT_SIMPLE_UPLOAD_MAX:
         url = _vt_request(f"{_VT_BASE}/files/upload_url", api_key)["data"]
     boundary = uuid.uuid4().hex
-    fname = os.path.basename(path)
     with open(path, "rb") as f:
         content = f.read()
     body = b"".join([
         f"--{boundary}\r\n".encode(),
-        f'Content-Disposition: form-data; name="file"; filename="{fname}"\r\n'.encode(),
+        f'Content-Disposition: form-data; name="file"; filename="{os.path.basename(path)}"\r\n'.encode(),
         b"Content-Type: application/octet-stream\r\n\r\n",
         content, b"\r\n",
         f"--{boundary}--\r\n".encode(),
@@ -787,8 +622,7 @@ def vt_upload(path, api_key):
 def vt_wait(analysis_id, api_key, timeout=600):
     deadline = time.time() + timeout
     while time.time() < deadline:
-        j = _vt_request(f"{_VT_BASE}/analyses/{analysis_id}", api_key)
-        attrs = j["data"]["attributes"]
+        attrs = _vt_request(f"{_VT_BASE}/analyses/{analysis_id}", api_key)["data"]["attributes"]
         if attrs.get("status") == "completed":
             return attrs["stats"]
         time.sleep(15)
@@ -796,74 +630,117 @@ def vt_wait(analysis_id, api_key, timeout=600):
 
 
 def vt_scan(path, sha256, api_key):
-    """Hash-lookup first (free, instant if VT has seen it); upload only if not.
-    Returns the analysis stats dict."""
+    """Analysis stats, uploading only if VirusTotal hasn't seen the hash."""
     stats = vt_lookup(sha256, api_key)
     if stats is None:
         stats = vt_wait(vt_upload(path, api_key), api_key)
     return stats
 
 
-# -- validate command --------------------------------------------------------
+def _vt_scan_path(path, sha, api_key, vt_max_malicious, label, errs, warns, seen=None):
+    """Scan one file, noting the result in warns and a gate failure in errs. A
+    scan that can't run is a note, not a failure. `seen` (sha -> (label, stats))
+    scans each distinct file once per run; a flagged file still fails every
+    label it appears under."""
+    seen = {} if seen is None else seen
+    if sha in seen:
+        first, stats = seen[sha]
+        if stats is None:
+            warns.append(f"{label}: same file as {first}, whose VirusTotal scan "
+                         f"could not complete; not scanned again")
+            return
+        warns.append(f"{label}: same file as {first}, already scanned; "
+                     f"not scanned again")
+    else:
+        try:
+            stats = vt_scan(path, sha, api_key)
+        except Exception as e:
+            seen[sha] = (label, None)
+            warns.append(f"{label}: VirusTotal scan could not complete ({e}); not gating on it")
+            return
+        seen[sha] = (label, stats)
+    mal = stats.get("malicious", 0)
+    sus = stats.get("suspicious", 0)
+    summary = (f"malicious={mal} suspicious={sus} "
+               f"harmless={stats.get('harmless', 0)} undetected={stats.get('undetected', 0)}")
+    warns.append(f"{label}: VirusTotal "
+                 f"{'flagged this file' if (mal or sus) else 'clean'}: {summary}")
+    if vt_max_malicious is not None and mal > vt_max_malicious:
+        errs.append(f"{label}: VirusTotal malicious={mal} exceeds "
+                    f"--vt-max-malicious={vt_max_malicious}")
 
-def _iter_json(paths):
+
+def _is_code_bearing(name, head):
+    return (os.path.splitext(name)[1].lower() in _CODE_EXTENSIONS
+            or any(head.startswith(m) for m in _CODE_MAGICS))
+
+
+def _vt_scan_zip_members(zip_path, api_key, vt_max_malicious, label, errs, warns, seen=None):
+    """Scan each code-bearing member on its own rather than the whole archive,
+    which could exceed VirusTotal's size limit."""
+    scanned = 0
+    with zipfile.ZipFile(zip_path) as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            with zf.open(info) as f:
+                head = f.read(8)
+                if not _is_code_bearing(info.filename, head):
+                    continue
+                data = head + f.read()
+            scanned += 1
+            fd, mtmp = tempfile.mkstemp(prefix="modindex_member_")
+            try:
+                with os.fdopen(fd, "wb") as out:
+                    out.write(data)
+                _vt_scan_path(mtmp, hashlib.sha256(data).hexdigest(), api_key, vt_max_malicious,
+                              f"{label} :: {info.filename}", errs, warns, seen)
+            finally:
+                os.remove(mtmp)
+    if scanned == 0:
+        warns.append(f"{label}: no executable members in the zip to VirusTotal-scan "
+                     "(all inert assets); the archive as a whole was not uploaded")
+
+
+# -- validate ------------------------------------------------------------------
+
+def _submission_files(paths):
+    """The .json files under paths, minus README.json and TEMPLATE.json."""
     for p in paths:
         if os.path.isdir(p):
             for dirpath, _dirs, files in os.walk(p):
                 for name in sorted(files):
-                    if name.endswith(".json"):
+                    if name.endswith(".json") and name.lower() not in _NON_SUBMISSION_BASENAMES:
                         yield os.path.join(dirpath, name)
-        elif p.endswith(".json"):
+        elif p.endswith(".json") and os.path.basename(p).lower() not in _NON_SUBMISSION_BASENAMES:
             yield p
 
 
-# Files under submissions/ that aren't submissions: folder READMEs and the
-# copy-me TEMPLATE.json. Skipped by validate, fill-hashes, and ingest.
-_NON_SUBMISSION_BASENAMES = {"readme.json", "template.json"}
-
-
-def _is_submission_file(path):
-    return os.path.basename(path).lower() not in _NON_SUBMISSION_BASENAMES
-
-
 def inspect_zip_bundle(path):
-    """Content checks for a package="zip" artifact, run on the downloaded,
-    hash-verified archive. Mirrors the launcher's extract-time guards
-    (modmanager._safe_extract_zip): no absolute paths, no '..' traversal, no
-    symlinks. Also caps decompression size and confirms an assembly is
-    present. Returns (errs, warns).
-
-    The archive root becomes the target folder (Mods/<id>/.<target>/) and the
-    mod's main assembly belongs there, so at least one .dll must sit at the
-    root. MelonLoader would load DLLs in subfolders too, but a zip whose only
-    DLLs are tucked into subfolders is almost always a packaging mistake.
-    Several root .dlls are fine. See docs/REPO_STRUCTURE.md."""
-    errs, warns = [], []
+    """Errors in a downloaded zip artifact: unsafe members, size caps, and no
+    .dll at the root (one only in subfolders is almost always a packaging
+    mistake)."""
+    errs = []
     try:
         zf = zipfile.ZipFile(path)
     except (zipfile.BadZipFile, OSError) as e:
-        return [f'package is "zip" but the download is not a valid .zip ({e})'], warns
+        return [f'package is "zip" but the download is not a valid .zip ({e})']
     with zf:
         infos = zf.infolist()
         if len(infos) > ZIP_MAX_ENTRIES:
             errs.append(f"zip has {len(infos)} entries, over the {ZIP_MAX_ENTRIES} cap")
-        total = 0
-        any_dll = root_dll = 0
+        total = any_dll = root_dll = 0
         for info in infos:
             name = info.filename
             if name.startswith(("/", "\\")):
                 errs.append(f"unsafe zip entry {name!r}: absolute path")
                 continue
-            # A colon anywhere, not just a drive letter in position 1: on NTFS
-            # "mod.dll:payload" is an alternate data stream hanging off
-            # mod.dll, which a traversal check reads as an ordinary relative
-            # name. Same rule the launcher's extractor applies at install time.
             if ":" in name:
                 errs.append(f"unsafe zip entry {name!r}: contains a colon "
                             f"(drive letter or NTFS alternate data stream)")
                 continue
             norm = name.replace("\\", "/")
-            if any(seg == ".." for seg in norm.split("/")):
+            if ".." in norm.split("/"):
                 errs.append(f"unsafe zip entry {name!r}: path traversal")
                 continue
             mode = (info.external_attr >> 16) & 0xFFFF
@@ -892,97 +769,13 @@ def inspect_zip_bundle(path):
                         "and the mod's main assembly belongs there; DLLs only in "
                         "subfolders are almost always a packaging mistake. Put the "
                         "mod assembly at the archive root.")
-    return errs, warns
-
-
-def _is_code_bearing(name, head):
-    """True if a zip member could carry executable code, by extension OR by leading
-    magic bytes, so a renamed executable is still caught. `head` is the first few
-    bytes of the member."""
-    if os.path.splitext(name)[1].lower() in _CODE_EXTENSIONS:
-        return True
-    return any(head.startswith(m) for m in _CODE_MAGICS)
-
-
-def _vt_scan_path(path, sha, api_key, vt_max_malicious, label, errs, warns, seen=None):
-    """VT-scan one file at `path` (hash `sha`), appending a note to warns and a hard
-    error to errs if malicious exceeds the threshold. A scan that can't run is a
-    warning, not a gate (same policy as before).
-
-    `seen` (sha256 -> (label, stats or None)) dedupes across a whole run: a file
-    already scanned under another label (the same DLL in two artifacts, a library
-    pinned by both builds, a zip member that is also a library) is not scanned
-    again, which matters when the free key allows four calls a minute. Its earlier
-    result still gates this label, so a flagged file fails every place it appears."""
-    if seen is not None and sha in seen:
-        first, stats = seen[sha]
-        if stats is None:
-            warns.append(f"{label}: same file as {first}, whose VirusTotal scan "
-                         f"could not complete; not scanned again")
-            return
-        warns.append(f"{label}: same file as {first}, already scanned; "
-                     f"not scanned again")
-    else:
-        try:
-            stats = vt_scan(path, sha, api_key)
-        except Exception as e:
-            if seen is not None:
-                seen[sha] = (label, None)
-            warns.append(f"{label}: VirusTotal scan could not complete ({e}); not gating on it")
-            return
-        if seen is not None:
-            seen[sha] = (label, stats)
-    mal = stats.get("malicious", 0)
-    sus = stats.get("suspicious", 0)
-    summary = (f"malicious={mal} suspicious={sus} "
-               f"harmless={stats.get('harmless', 0)} undetected={stats.get('undetected', 0)}")
-    warns.append(f"{label}: VirusTotal "
-                 f"{'flagged this file' if (mal or sus) else 'clean'}: {summary}")
-    if vt_max_malicious is not None and mal > vt_max_malicious:
-        errs.append(f"{label}: VirusTotal malicious={mal} exceeds "
-                    f"--vt-max-malicious={vt_max_malicious}")
-
-
-def _vt_scan_zip_members(zip_path, api_key, vt_max_malicious, label, errs, warns, seen=None):
-    """VT-scan only the code-bearing members of a zip bundle, each individually,
-    instead of uploading the whole archive (which for a bulky asset mod would be
-    huge and mostly inert). Inert members are read only far enough to check their
-    magic bytes; a code-bearing one is extracted to a temp file and scanned."""
-    scanned = 0
-    with zipfile.ZipFile(zip_path) as zf:
-        for info in zf.infolist():
-            if info.is_dir():
-                continue
-            with zf.open(info) as f:
-                head = f.read(8)
-                if not _is_code_bearing(info.filename, head):
-                    continue                       # inert asset, not read past its head
-                data = head + f.read()
-            scanned += 1
-            sha = hashlib.sha256(data).hexdigest()
-            fd, mtmp = tempfile.mkstemp(prefix="modindex_member_")
-            try:
-                with os.fdopen(fd, "wb") as out:
-                    out.write(data)
-                _vt_scan_path(mtmp, sha, api_key, vt_max_malicious,
-                              f"{label} :: {info.filename}", errs, warns, seen)
-            finally:
-                if os.path.exists(mtmp):
-                    os.remove(mtmp)
-    if scanned == 0:
-        warns.append(f"{label}: no executable members in the zip to VirusTotal-scan "
-                     "(all inert assets); the archive as a whole was not uploaded")
+    return errs
 
 
 def _check_file(url, expected_sha, api_key, vt_max_malicious, label, allow_zip=False,
                 vt_seen=None):
-    """Download url, verify its sha256 == expected, and scan it. For an artifact
-    (allow_zip=True) the file type is sniffed from its own bytes: a zip is inspected
-    and its code-bearing members VT-scanned (not the whole archive, see
-    _vt_scan_zip_members); a single dll is VT-scanned whole. Libraries
-    (allow_zip=False) are always single files. vt_seen dedupes VirusTotal scans by
-    sha256 (see _vt_scan_path). Returns (hard_errors, warnings). Cleans up its
-    temp file."""
+    """Download url, verify its hash, inspect it if it's a zip artifact, and
+    scan it. Returns (errs, warns)."""
     errs, warns = [], []
     try:
         tmp, actual = download_and_hash(url)
@@ -992,54 +785,37 @@ def _check_file(url, expected_sha, api_key, vt_max_malicious, label, allow_zip=F
         if actual.lower() != str(expected_sha).lower():
             errs.append(f"{label}: sha256 mismatch, manifest says {expected_sha}, file is {actual}")
             return errs, warns
-        is_zip = False
-        if allow_zip:
-            with open(tmp, "rb") as f:
-                is_zip = _sniff_package(f.read(8)) == "zip"
+        with open(tmp, "rb") as f:
+            is_zip = allow_zip and _sniff_package(f.read(8)) == "zip"
         if is_zip:
             warns.append(f"{label}: detected a zip bundle (package=zip)")
-            ze, zw = inspect_zip_bundle(tmp)
-            errs += [f"{label}: {e}" for e in ze]
-            warns += [f"{label}: {w}" for w in zw]
+            errs += [f"{label}: {e}" for e in inspect_zip_bundle(tmp)]
             if errs:
-                return errs, warns     # a structurally-broken bundle isn't worth scanning
-            if api_key:
-                _vt_scan_zip_members(tmp, api_key, vt_max_malicious, label, errs, warns,
-                                     vt_seen)
-            else:
-                warns.append(f"{label}: VirusTotal skipped (no VIRUSTOTAL_API_KEY set)")
-        elif api_key:
-            _vt_scan_path(tmp, actual, api_key, vt_max_malicious, label, errs, warns,
-                          vt_seen)
-        else:
+                return errs, warns
+        if not api_key:
             warns.append(f"{label}: VirusTotal skipped (no VIRUSTOTAL_API_KEY set)")
+        elif is_zip:
+            _vt_scan_zip_members(tmp, api_key, vt_max_malicious, label, errs, warns, vt_seen)
+        else:
+            _vt_scan_path(tmp, actual, api_key, vt_max_malicious, label, errs, warns, vt_seen)
     finally:
-        if os.path.exists(tmp):
-            os.remove(tmp)
+        os.remove(tmp)
     return errs, warns
 
 
 def cmd_validate(args):
     root = repo_root(args.repo)
-    targets = args.paths or [os.path.join(root, "submissions")]
-    # README.json and the copy-me TEMPLATE.json are not submissions; an empty
-    # submissions/ folder is also fine (no manifests yet).
-    files = [f for f in _iter_json(targets) if _is_submission_file(f)]
+    files = list(_submission_files(args.paths or [os.path.join(root, "submissions")]))
     if not files:
         print("No submission manifests to validate.")
         return 0
 
     api_key = os.environ.get("VIRUSTOTAL_API_KEY", "").strip() or None
-    failures = 0
-    # Read once for the whole run: the dependency-target rule is the only check
-    # that has to look at manifests other than the one being validated.
     known = _known_manifests(root)
-    # One VirusTotal scan per distinct file for the whole run, by sha256.
     vt_seen = {}
-
+    failures = 0
     for path in files:
-        rel = os.path.relpath(path, root)
-        print(f"\n== {rel} ==")
+        print(f"\n== {os.path.relpath(path, root)} ==")
         try:
             m = _load_json(path)
         except Exception as e:
@@ -1049,27 +825,17 @@ def cmd_validate(args):
 
         errs = validate_structure(m)
         warns = []
-
         if not errs:
-            # After the structural pass, so a malformed dependency entry is
-            # reported once, by the check that owns it.
-            e, w = validate_dependency_targets(m, known)
-            errs += e
-            warns += w
-
+            errs, warns = validate_dependency_targets(m, known)
         if not errs:
             for i, art in enumerate(m["artifacts"]):
                 label = f"artifacts[{i}] ({'+'.join(art['targets'])})"
-                e, w = _check_file(art["download_url"], art["sha256"], api_key,
-                                   args.vt_max_malicious, label, allow_zip=True,
-                                   vt_seen=vt_seen)
-                errs += e
-                warns += w
-                for j, lib in enumerate(art["library_dependencies"]):
-                    e, w = _check_file(lib["download_url"], lib["sha256"], api_key,
-                                       args.vt_max_malicious,
-                                       f"{label} library[{j}] {lib['name']}",
-                                       vt_seen=vt_seen)
+                checks = [(art, label, True)] + [
+                    (lib, f"{label} library[{j}] {lib['name']}", False)
+                    for j, lib in enumerate(art["library_dependencies"])]
+                for obj, what, allow_zip in checks:
+                    e, w = _check_file(obj["download_url"], obj["sha256"], api_key,
+                                       args.vt_max_malicious, what, allow_zip, vt_seen)
                     errs += e
                     warns += w
 
@@ -1086,11 +852,9 @@ def cmd_validate(args):
     return 1 if failures else 0
 
 
-# -- fill-hashes command -----------------------------------------------------
+# -- fill-hashes ---------------------------------------------------------------
 
 def _fill_one(obj, label):
-    """Downloads obj['download_url'], writes its sha256 into obj['sha256'].
-    Returns True on success, False if it couldn't be fetched."""
     url = obj.get("download_url")
     if not url:
         print(f"  skip  {label}: no download_url")
@@ -1107,12 +871,8 @@ def _fill_one(obj, label):
 
 
 def cmd_fill(args):
-    """Populate the sha256 fields in a manifest by downloading the files it points
-    at. Run it after publishing your release and before you submit, so the hashes
-    you commit are the real ones (validation still verifies them)."""
     root = repo_root(args.repo)
-    targets = args.paths or [os.path.join(root, "submissions")]
-    files = [f for f in _iter_json(targets) if _is_submission_file(f)]
+    files = list(_submission_files(args.paths or [os.path.join(root, "submissions")]))
     if not files:
         print("No manifest files to fill.")
         return 0
@@ -1145,7 +905,7 @@ def cmd_fill(args):
                 if isinstance(lib, dict):
                     ok = _fill_one(lib, f"{label} library[{j}] {lib.get('name', '')}") and ok
         if ok:
-            _write_json(path, m)     # rewrite in place, hashes filled in
+            _write_json(path, m)
             print(f"  wrote {os.path.relpath(path, root)}")
         else:
             failures += 1
@@ -1155,74 +915,35 @@ def cmd_fill(args):
     return 1 if failures else 0
 
 
-# -- build command -----------------------------------------------------------
-
-def _vkey(version):
-    return tuple(int(x) for x in version.split("."))
-
+# -- build ---------------------------------------------------------------------
 
 def _ingest_submissions(root):
-    """Validate (structurally) and move submissions/<id>/<v>.json into
-    manifests/<author>/<repo>/<v>.json. Returns list of source paths moved."""
-    sub_dir = os.path.join(root, "submissions")
-    man_dir = os.path.join(root, "manifests")
+    """Move each valid submission into manifests/, with package sniffed from
+    its file. Returns the moved paths."""
     moved = []
-    for path in _iter_json([sub_dir]):
-        if not _is_submission_file(path):
-            continue
+    for path in _submission_files([os.path.join(root, "submissions")]):
         m = _load_json(path)
         errs = validate_structure(m)
         if errs:
             raise ValidationError(
                 f"{os.path.relpath(path, root)} is not structurally valid:\n  - "
                 + "\n  - ".join(errs))
-        # Determine dll vs zip from each artifact's actual file and bake it
-        # into the compiled manifest; submitters never declare it.
         for art in m["artifacts"]:
             art["package"] = _sniff_package_from_url(art["download_url"])
         author, repo = parse_id(m["id"])
-        dest = os.path.join(man_dir, author, repo, f'{m["version"]}.json')
+        dest = os.path.join(root, "manifests", author, repo, f'{m["version"]}.json')
         _write_json(dest, ordered_manifest(m))
         moved.append(path)
         print(f"ingested {os.path.relpath(path, root)} -> {os.path.relpath(dest, root)}")
     return moved
 
 
-def _collect_manifests(root):
-    """id -> {version: manifest} from every manifests/**/<version>.json,
-    ignoring latest*.json pointers."""
-    man_dir = os.path.join(root, "manifests")
-    mods = {}
-    for dirpath, _dirs, files in os.walk(man_dir):
-        for name in sorted(files):
-            if not name.endswith(".json") or name.startswith("latest"):
-                continue
-            m = _load_json(os.path.join(dirpath, name))
-            errs = validate_structure(m)
-            # A compiled manifest has had every artifact's package sniffed by
-            # ingest; one without it was hand-placed and skipped that step.
-            if not errs:
-                errs = [f"artifacts[{i}] has no package (ingest sets it from the file)"
-                        for i, a in enumerate(m["artifacts"]) if "package" not in a]
-            if errs:
-                raise ValidationError(
-                    f"{os.path.relpath(os.path.join(dirpath, name), root)} is invalid:\n  - "
-                    + "\n  - ".join(errs))
-            mods.setdefault(m["id"], {})[m["version"]] = m
-    return mods
-
-
 def cmd_build(args):
     root = repo_root(args.repo)
     moved = _ingest_submissions(root) if args.ingest else []
-
     mods = _collect_manifests(root)
 
-    # Repo-wide, not just the freshly-ingested submission: a dependency edge is a
-    # relationship between two manifests, so publishing a NEW version of a mod can
-    # invalidate an OLD version of something that depends on it. Only the compiler
-    # sees the whole graph at once, and it must not emit an index describing an
-    # unsatisfiable dependency.
+    # Checked repo-wide: a new release can break an old dependent.
     target_errs = []
     for mod_id in sorted(mods):
         for version in sorted(mods[mod_id], key=_vkey):
@@ -1235,48 +956,36 @@ def cmd_build(args):
                               + "\n  - ".join(target_errs))
 
     repo_index = {"index_version": SUPPORTED_INDEX_MAJOR, "mods": {}}
-
-    # An empty manifests/ tree is valid (a freshly published repo with no mods),
-    # so it still has to write an empty repository.json. Otherwise removing the
-    # last mod would leave a stale index behind.
     for mod_id in sorted(mods):
         versions = mods[mod_id]
         author, repo = parse_id(mod_id)
         mod_dir = os.path.join(root, "manifests", author, repo)
-
         ordered_versions = sorted(versions, key=_vkey)
-        highest_overall = ordered_versions[-1]
-
-        # versions grouped per major, ascending (so the last in each is highest)
-        versions_by_major = {}
+        by_major = {}
         for v in ordered_versions:
-            versions_by_major.setdefault(v.split(".")[0], []).append(v)
+            by_major.setdefault(v.split(".")[0], []).append(v)
 
-        # pointer files: overall latest, plus the highest in each major
         _write_json(os.path.join(mod_dir, "latest.json"),
-                    ordered_manifest(versions[highest_overall]))
-        for major, vs in versions_by_major.items():
+                    ordered_manifest(versions[ordered_versions[-1]]))
+        for major, vs in by_major.items():
             _write_json(os.path.join(mod_dir, f"latest.{major}.json"),
                         ordered_manifest(versions[vs[-1]]))
 
-        # repository.json entry: one slim discovery summary per major
-        repo_index["mods"][mod_id] = {}
-        for major in sorted(versions_by_major, key=int):
-            vs = versions_by_major[major]
-            repo_index["mods"][mod_id][major] = summary_entry(versions[vs[-1]], vs)
-        print(f"indexed {mod_id}: majors {sorted(versions_by_major, key=int)} "
-              f"(latest {highest_overall})")
+        majors = sorted(by_major, key=int)
+        repo_index["mods"][mod_id] = {
+            major: summary_entry(versions[by_major[major][-1]], by_major[major])
+            for major in majors}
+        print(f"indexed {mod_id}: majors {majors} (latest {ordered_versions[-1]})")
 
     _write_json(os.path.join(root, "repository.json"), repo_index)
     print(f"\nwrote repository.json ({len(repo_index['mods'])} mod(s))")
 
     if args.prune:
+        sub_root = os.path.abspath(os.path.join(root, "submissions"))
         for path in moved:
             os.remove(path)
-            # tidy now-empty submission dirs (but never the submissions/ root)
             d = os.path.dirname(path)
-            sub_root = os.path.join(root, "submissions")
-            while os.path.abspath(d) != os.path.abspath(sub_root) and os.path.isdir(d) and not os.listdir(d):
+            while os.path.abspath(d) != sub_root and os.path.isdir(d) and not os.listdir(d):
                 os.rmdir(d)
                 d = os.path.dirname(d)
         if moved:
@@ -1284,47 +993,13 @@ def cmd_build(args):
     return 0
 
 
-# -- site command --------------------------------------------------------------
-
-# Where the generator injects the mod list. The empty array is part of the
-# marker and is replaced along with it, so the template stays a valid,
-# directly-openable page (chrome, empty list) rather than a broken half-file
-# only the generator can use - while the generated file gets `= [...]` and not
-# `= [...][]`, which is a syntax error.
-SITE_MARKER = "/*__MODS__*/[]"
-
-# Optional, display-only, and never part of an install. Raster formats only:
-# script inside an SVG doesn't execute via <img>, but it does the moment
-# anything renders it another way, and excluding the format removes the whole
-# question rather than depending on how the page happens to embed it today.
-SCREENSHOT_EXT_RE = re.compile(r"\.(?:png|jpe?g|webp|gif)$", re.IGNORECASE)
-SCREENSHOT_MAX = 4
-_COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-
+# -- site ----------------------------------------------------------------------
 
 def _screenshot_ok(url, author, repo):
-    """None if url may be published on the page, else the reason it may not.
-
-    Four rules, and each one closes a specific hole rather than being general
-    tidiness:
-
-    - **On GitHub, under the mod's own owner/repo.** Same trust boundary the
-      mod's binary already has (see _url_owned_by, which enforces it for
-      download_url as a hard error). Without it a manifest could point the page
-      at any host on the internet, which is a tracker pointed at every visitor,
-      or at another author's repository.
-    - **An immutable address.** A release asset, or a raw URL pinning a
-      40-character commit sha. A branch-relative raw URL is repointable after
-      review, so approving one binds nothing: whatever a reviewer looked at
-      could be swapped for anything afterwards.
-    - **A raster extension.** See SCREENSHOT_EXT_RE.
-    - **https.** Everything else here already requires it.
-
-    Note what these rules do NOT claim: a URL ending in .png can still serve
-    something that isn't an image. That's tolerable precisely because the page
-    only ever puts it in an <img>, where a non-image simply fails to render -
-    so the check that matters is where it comes from, not what it's named.
-    """
+    """None if url may go on the page, else why not. It must be https on
+    GitHub under the mod's own repo (no third-party host sees visitors), at an
+    immutable address (a release asset, or raw at a commit sha, so what was
+    reviewed can't be swapped), and a raster image (no SVG script)."""
     if not isinstance(url, str) or not _is_https_url(url):
         return "must be an https:// URL"
     p = urlparse(url)
@@ -1333,25 +1008,18 @@ def _screenshot_ok(url, author, repo):
         return "must end in .png, .jpg, .jpeg, .webp or .gif (an .svg can carry script)"
     if len(parts) < 3 or parts[0].lower() != author.lower() or parts[1].lower() != repo.lower():
         return f"must live under {author}/{repo}"
-
     host = p.netloc.lower()
     if host == "github.com":
-        if parts[2].lower() != "releases":
-            return "on github.com, only a release asset URL is accepted"
-        return None
+        return None if parts[2].lower() == "releases" else (
+            "on github.com, only a release asset URL is accepted")
     if host == "raw.githubusercontent.com":
-        if not _COMMIT_SHA_RE.match(parts[2]):
-            return ("a raw URL must pin a 40-character commit sha rather than a "
-                    "branch name, which can be repointed after review")
-        return None
+        return None if _COMMIT_SHA_RE.match(parts[2]) else (
+            "a raw URL must pin a 40-character commit sha rather than a "
+            "branch name, which can be repointed after review")
     return "must be hosted on github.com or raw.githubusercontent.com"
 
 
 def _screenshots_for(m):
-    """The publishable screenshots off one manifest. Anything rejected is
-    skipped WITH a printed reason rather than dropped quietly: a screenshot
-    that silently never appears is indistinguishable from one the author
-    forgot to add."""
     raw = m.get("screenshots")
     if raw is None:
         return []
@@ -1361,30 +1029,20 @@ def _screenshots_for(m):
     if len(raw) > SCREENSHOT_MAX:
         print(f"note  {m['id']}: {len(raw)} screenshots listed, only the first "
               f"{SCREENSHOT_MAX} are published")
-
     author, repo = parse_id(m["id"])
     out = []
     for url in raw[:SCREENSHOT_MAX]:
         why = _screenshot_ok(url, author, repo)
         if why:
             print(f"note  {m['id']}: not publishing screenshot {url!r} - {why}")
-            continue
-        out.append(url)
+        else:
+            out.append(url)
     return out
 
 
 def cmd_site(args):
-    """Bake tools/page.html + the current mod list into site/index.html.
-
-    The page gets its data at build time rather than fetching repository.json
-    live: it can then never render a half-loaded or unreachable index, the
-    screenshot URLs in it have been through _screenshot_ok, and the collapse to
-    one row per mod happens here instead of in every visitor's browser.
-
-    Deliberately reads manifests/ rather than repository.json, because the page
-    needs a field (screenshots) that the index's slim per-major summary doesn't
-    carry -- and adding it there would put display data into the file every
-    launcher downloads on every browse."""
+    """Bake the mod list into the page. It reads manifests/, not
+    repository.json, because the index doesn't carry screenshots."""
     root = repo_root(args.repo)
     template_path = os.path.join(root, "tools", "page.html")
     if not os.path.isfile(template_path):
@@ -1397,28 +1055,15 @@ def cmd_site(args):
     mods = _collect_manifests(root)
     rows = []
     for mod_id in sorted(mods):
-        versions = mods[mod_id]
-        # The highest version overall is by definition in the highest major, so
-        # this is the same row the launcher's browse list shows.
-        latest = sorted(versions, key=_vkey)[-1]
-        m = versions[latest]
-        rows.append({
-            "id": mod_id,
-            "name": m.get("name", mod_id),
-            "author": m.get("author", mod_id.split(".", 1)[0]),
-            "description": m.get("description", ""),
-            "targets": manifest_targets(m),
-            "parity_required": parity_required(m),
-            "latest": latest,
-            "screenshots": _screenshots_for(m),
-        })
+        latest = sorted(mods[mod_id], key=_vkey)[-1]
+        m = mods[mod_id][latest]
+        rows.append({"id": mod_id, **_display(m), "targets": manifest_targets(m),
+                     "parity_required": parity_required(m), "latest": latest,
+                     "screenshots": _screenshots_for(m)})
     rows.sort(key=lambda r: r["name"].lower())
 
-    # Escaping '<' is what keeps a manifest string from closing the <script>
-    # element it's embedded in; < is valid inside a JSON string literal, so
-    # the data still parses as exactly what it was.
+    # Escaping '<' stops a string from closing the <script> it's embedded in.
     data = json.dumps(rows, ensure_ascii=False, indent=2).replace("<", "\\u003c")
-
     out_dir = args.out or os.path.join(root, "site")
     out_path = os.path.join(out_dir, "index.html")
     os.makedirs(out_dir, exist_ok=True)
@@ -1430,7 +1075,7 @@ def cmd_site(args):
     return 0
 
 
-# -- entry point --------------------------------------------------------------
+# -- entry point ---------------------------------------------------------------
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="modindex", description=__doc__,
