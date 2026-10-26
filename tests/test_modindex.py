@@ -463,7 +463,7 @@ class InspectZipBundle(unittest.TestCase):
         return tmp.name
 
     def test_valid_bundle_passes(self):
-        errs, warns = mi.inspect_zip_bundle(self._zip([
+        errs = mi.inspect_zip_bundle(self._zip([
             ("Bundle.dll", b"MZ"), ("Content/data.bundle", b"assets")]))
         self.assertEqual(errs, [])
 
@@ -471,23 +471,23 @@ class InspectZipBundle(unittest.TestCase):
         tmp = tempfile.NamedTemporaryFile(prefix="nz_", suffix=".zip", delete=False)
         tmp.write(b"not a zip"); tmp.close()
         self.addCleanup(lambda: os.remove(tmp.name))
-        self.assertTrue(mi.inspect_zip_bundle(tmp.name)[0])
+        self.assertTrue(mi.inspect_zip_bundle(tmp.name))
 
     def test_no_dll_is_error(self):
-        errs, _ = mi.inspect_zip_bundle(self._zip([("readme.txt", b"hi")]))
+        errs = mi.inspect_zip_bundle(self._zip([("readme.txt", b"hi")]))
         self.assertTrue(any("no .dll" in e for e in errs))
 
     def test_dll_only_in_subfolder_is_error(self):
         # MelonLoader would load it, but a zip whose only DLLs sit in subfolders
         # is almost always a packaging mistake, so it's a hard fail.
-        errs, _ = mi.inspect_zip_bundle(self._zip([("sub/Mod.dll", b"MZ")]))
+        errs = mi.inspect_zip_bundle(self._zip([("sub/Mod.dll", b"MZ")]))
         self.assertTrue(any("archive root" in e for e in errs))
 
     def test_traversal_and_absolute_and_symlink_rejected(self):
-        self.assertTrue(mi.inspect_zip_bundle(self._zip([("../evil.dll", b"x")]))[0])
-        self.assertTrue(mi.inspect_zip_bundle(self._zip([("/abs.dll", b"x")]))[0])
+        self.assertTrue(mi.inspect_zip_bundle(self._zip([("../evil.dll", b"x")])))
+        self.assertTrue(mi.inspect_zip_bundle(self._zip([("/abs.dll", b"x")])))
         self.assertTrue(mi.inspect_zip_bundle(
-            self._zip([("link", b"/etc/passwd", 0o120777 << 16)]))[0])
+            self._zip([("link", b"/etc/passwd", 0o120777 << 16)])))
 
     def test_colon_entries_rejected(self):
         """A drive-relative name, and an NTFS alternate data stream: on the
@@ -495,14 +495,14 @@ class InspectZipBundle(unittest.TestCase):
         Mod.dll rather than a file. Neither contains a separator or a "..", so
         the traversal checks above read both as ordinary relative names."""
         for name in ("C:evil.dll", "Mod.dll:payload"):
-            errs, _ = mi.inspect_zip_bundle(self._zip([("Mod.dll", b"MZ"), (name, b"x")]))
+            errs = mi.inspect_zip_bundle(self._zip([("Mod.dll", b"MZ"), (name, b"x")]))
             self.assertTrue(any("colon" in e for e in errs), name)
 
     def test_too_many_entries_rejected(self):
         saved = mi.ZIP_MAX_ENTRIES
         mi.ZIP_MAX_ENTRIES = 3
         self.addCleanup(lambda: setattr(mi, "ZIP_MAX_ENTRIES", saved))
-        errs, _ = mi.inspect_zip_bundle(self._zip(
+        errs = mi.inspect_zip_bundle(self._zip(
             [("m.dll", b"MZ")] + [(f"f{i}", b"x") for i in range(5)]))
         self.assertTrue(any("entries" in e for e in errs))
 
@@ -511,7 +511,7 @@ class InspectZipBundle(unittest.TestCase):
         mi.ZIP_RATIO_MIN_SIZE = 1024
         self.addCleanup(lambda: setattr(mi, "ZIP_RATIO_MIN_SIZE", saved))
         # 2 MB of zeros compresses tiny -> huge ratio.
-        errs, _ = mi.inspect_zip_bundle(self._zip([
+        errs = mi.inspect_zip_bundle(self._zip([
             ("m.dll", b"MZ"), ("big.bin", b"\0" * (2 * 1024 * 1024))]))
         self.assertTrue(any("ratio" in e for e in errs))
 
